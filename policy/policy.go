@@ -1,0 +1,518 @@
+/*
+ * @Author: kamalyes 501893067@qq.com
+ * @Date: 2025-03-28 00:00:00
+ * @LastEditors: kamalyes 501893067@qq.com
+ * @LastEditTime: 2025-03-28 00:00:00
+ * @FilePath: \go-casbin\policy\policy.go
+ * @Description: 核心策略定义与操作（含批量、过滤、更新）
+ *
+ * Copyright (c) 2025 by kamalyes, All Rights Reserved.
+ */
+
+package policy
+
+import (
+	"strings"
+
+	"github.com/kamalyes/go-casbin/errors"
+	"github.com/kamalyes/go-casbin/model"
+	"github.com/kamalyes/go-logger"
+)
+
+// Policy 核心策略管理器
+// 负责策略的加载、保存、增删改查操作
+// 支持自动保存、缓存失效、适配器回退等机制
+type Policy struct {
+	model   *model.Model   // 关联的权限模型
+	adapter Adapter        // 策略存储适配器
+	cache   *PolicyCache   // 策略缓存（基于 syncx.Map）
+	logger  logger.ILogger // 日志记录器
+}
+
+// NewPolicy 创建策略管理器
+func NewPolicy(m *model.Model, adapter Adapter, log logger.ILogger) *Policy {
+	return &Policy{
+		model:   m,
+		adapter: adapter,
+		cache:   NewPolicyCache(),
+		logger:  log,
+	}
+}
+
+// LoadPolicy 从适配器加载所有策略到内存模型
+// 加载前会清空现有策略，加载后使缓存全部失效
+func (p *Policy) LoadPolicy() error {
+	if p.adapter == nil {
+		return errors.NewPolicyAdapterFailedError("adapter is nil")
+	}
+
+	policies, err := p.adapter.LoadPolicy()
+	if err != nil {
+		return errors.WrapError("LoadPolicy", err)
+	}
+
+	p.model.ClearPolicies()
+	for _, line := range policies {
+		p.addPolicyInternal(line)
+	}
+
+	p.cache.InvalidateAll()
+	p.logger.InfoKV("Policy loaded", "count", len(policies))
+	return nil
+}
+
+// LoadFilteredPolicy 按过滤条件从适配器加载策略
+// 如果适配器不支持过滤接口，则回退到加载全部策略
+func (p *Policy) LoadFilteredPolicy(filter interface{}) error {
+	fa, ok := p.adapter.(FilteredAdapter)
+	if !ok {
+		return p.LoadPolicy()
+	}
+
+	policies, err := fa.LoadFilteredPolicy(filter)
+	if err != nil {
+		return errors.WrapError("LoadFilteredPolicy", err)
+	}
+
+	p.model.ClearPolicies()
+	for _, line := range policies {
+		p.addPolicyInternal(line)
+	}
+
+	p.cache.InvalidateAll()
+	p.logger.InfoKV("Filtered policy loaded", "count", len(policies))
+	return nil
+}
+
+// IsFiltered 返回适配器是否已使用过滤加载
+func (p *Policy) IsFiltered() bool {
+	fa, ok := p.adapter.(FilteredAdapter)
+	if !ok {
+		return false
+	}
+	return fa.IsFiltered()
+}
+
+// SavePolicy 将内存模型中的所有策略保存到适配器
+func (p *Policy) SavePolicy() error {
+	if p.adapter == nil {
+		return errors.NewPolicyAdapterFailedError("adapter is nil")
+	}
+
+	var policies []string
+	for key, assertion := range p.model.GetAssertions() {
+		for _, policy := range assertion.Policies {
+			policies = append(policies, key+", "+strings.Join(policy, ", "))
+		}
+	}
+
+	if err := p.adapter.SavePolicy(policies); err != nil {
+		return errors.WrapError("SavePolicy", err)
+	}
+
+	p.logger.InfoKV("Policy saved", "count", len(policies))
+	return nil
+}
+
+// AddPolicy 添加单条策略到内存模型和适配器
+// 如果适配器写入失败，会回滚内存中的策略
+func (p *Policy) AddPolicy(sec, ptype string, policy []string) error {
+	assertion := p.model.GetAssertion(ptype)
+	if assertion == nil {
+		return errors.NewPolicyNotFoundError(ptype)
+	}
+
+	if assertion.HasPolicy(policy) {
+		return errors.NewPolicyAlreadyExistsError(strings.Join(policy, ", "))
+	}
+
+	assertion.AddPolicy(policy)
+
+	if p.adapter != nil {
+		line := ptype + ", " + strings.Join(policy, ", ")
+		if err := p.adapter.AddPolicy(line); err != nil {
+			assertion.RemovePolicy(policy)
+			return errors.WrapError("AddPolicy", err)
+		}
+	}
+
+	p.cache.Invalidate(ptype)
+	p.logger.InfoKV("Policy added", "type", ptype, "policy", strings.Join(policy, ", "))
+	return nil
+}
+
+// AddPolicies 批量添加策略，支持适配器回退和回滚
+func (p *Policy) AddPolicies(sec, ptype string, rules [][]string) error {
+	assertion := p.model.GetAssertion(ptype)
+	if assertion == nil {
+		return errors.NewPolicyNotFoundError(ptype)
+	}
+
+	var toAdd [][]string
+	for _, rule := range rules {
+		if !assertion.HasPolicy(rule) {
+			toAdd = append(toAdd, rule)
+		}
+	}
+
+	if len(toAdd) == 0 {
+		return nil
+	}
+
+	for _, rule := range toAdd {
+		assertion.AddPolicy(rule)
+	}
+
+	if p.adapter != nil {
+		if ba, ok := p.adapter.(BatchAdapter); ok {
+			var lines []string
+			for _, rule := range toAdd {
+				lines = append(lines, ptype+", "+strings.Join(rule, ", "))
+			}
+			if err := ba.AddPolicies(lines); err != nil {
+				for _, rule := range toAdd {
+					assertion.RemovePolicy(rule)
+				}
+				return errors.WrapError("AddPolicies", err)
+			}
+		} else {
+			for _, rule := range toAdd {
+				line := ptype + ", " + strings.Join(rule, ", ")
+				if err := p.adapter.AddPolicy(line); err != nil {
+					for _, r := range toAdd {
+						assertion.RemovePolicy(r)
+					}
+					return errors.WrapError("AddPolicies", err)
+				}
+			}
+		}
+	}
+
+	p.cache.Invalidate(ptype)
+	p.logger.InfoKV("Policies added", "type", ptype, "count", len(toAdd))
+	return nil
+}
+
+// AddPoliciesEx 批量添加策略（忽略已存在的策略）
+func (p *Policy) AddPoliciesEx(sec, ptype string, rules [][]string) error {
+	assertion := p.model.GetAssertion(ptype)
+	if assertion == nil {
+		return errors.NewPolicyNotFoundError(ptype)
+	}
+
+	var toAdd [][]string
+	for _, rule := range rules {
+		if !assertion.HasPolicy(rule) {
+			toAdd = append(toAdd, rule)
+		}
+	}
+
+	if len(toAdd) == 0 {
+		return nil
+	}
+
+	return p.AddPolicies(sec, ptype, toAdd)
+}
+
+// RemovePolicy 从内存模型和适配器中删除单条策略
+func (p *Policy) RemovePolicy(sec, ptype string, policy []string) error {
+	assertion := p.model.GetAssertion(ptype)
+	if assertion == nil {
+		return errors.NewPolicyNotFoundError(ptype)
+	}
+
+	if !assertion.RemovePolicy(policy) {
+		return errors.NewPolicyNotFoundError(strings.Join(policy, ", "))
+	}
+
+	if p.adapter != nil {
+		line := ptype + ", " + strings.Join(policy, ", ")
+		if err := p.adapter.RemovePolicy(line); err != nil {
+			assertion.AddPolicy(policy)
+			return errors.WrapError("RemovePolicy", err)
+		}
+	}
+
+	p.cache.Invalidate(ptype)
+	p.logger.InfoKV("Policy removed", "type", ptype, "policy", strings.Join(policy, ", "))
+	return nil
+}
+
+// RemovePolicies 批量删除策略
+func (p *Policy) RemovePolicies(sec, ptype string, rules [][]string) error {
+	assertion := p.model.GetAssertion(ptype)
+	if assertion == nil {
+		return errors.NewPolicyNotFoundError(ptype)
+	}
+
+	removed := make([][]string, 0)
+	for _, rule := range rules {
+		if assertion.RemovePolicy(rule) {
+			removed = append(removed, rule)
+		}
+	}
+
+	if p.adapter != nil {
+		if ba, ok := p.adapter.(BatchAdapter); ok {
+			var lines []string
+			for _, rule := range removed {
+				lines = append(lines, ptype+", "+strings.Join(rule, ", "))
+			}
+			if err := ba.RemovePolicies(lines); err != nil {
+				for _, rule := range removed {
+					assertion.AddPolicy(rule)
+				}
+				return errors.WrapError("RemovePolicies", err)
+			}
+		} else {
+			for _, rule := range removed {
+				line := ptype + ", " + strings.Join(rule, ", ")
+				if err := p.adapter.RemovePolicy(line); err != nil {
+					for _, r := range removed {
+						assertion.AddPolicy(r)
+					}
+					return errors.WrapError("RemovePolicies", err)
+				}
+			}
+		}
+	}
+
+	p.cache.Invalidate(ptype)
+	p.logger.InfoKV("Policies removed", "type", ptype, "count", len(removed))
+	return nil
+}
+
+func (p *Policy) RemoveFilteredPolicy(sec, ptype string, fieldIndex int, fieldValues ...string) error {
+	assertion := p.model.GetAssertion(ptype)
+	if assertion == nil {
+		return errors.NewPolicyNotFoundError(ptype)
+	}
+
+	var removed [][]string
+	var remaining [][]string
+
+	for _, policy := range assertion.Policies {
+		match := true
+		for i, value := range fieldValues {
+			if fieldIndex+i < len(policy) && policy[fieldIndex+i] != value {
+				match = false
+				break
+			}
+		}
+		if match {
+			removed = append(removed, policy)
+		} else {
+			remaining = append(remaining, policy)
+		}
+	}
+
+	if len(removed) == 0 {
+		return nil
+	}
+
+	assertion.ClearPolicies()
+	for _, r := range remaining {
+		assertion.AddPolicy(r)
+	}
+
+	if p.adapter != nil {
+		if ua, ok := p.adapter.(UpdatableAdapter); ok {
+			var newLines []string
+			for _, r := range remaining {
+				newLines = append(newLines, ptype+", "+strings.Join(r, ", "))
+			}
+			if err := ua.UpdateFilteredPolicies(newLines, fieldIndex, fieldValues...); err != nil {
+				return errors.WrapError("RemoveFilteredPolicy", err)
+			}
+		} else {
+			for _, rule := range removed {
+				line := ptype + ", " + strings.Join(rule, ", ")
+				_ = p.adapter.RemovePolicy(line)
+			}
+		}
+	}
+
+	p.cache.Invalidate(ptype)
+	p.logger.InfoKV("Filtered policies removed", "type", ptype, "count", len(removed))
+	return nil
+}
+
+func (p *Policy) UpdatePolicy(sec, ptype string, oldPolicy, newPolicy []string) error {
+	assertion := p.model.GetAssertion(ptype)
+	if assertion == nil {
+		return errors.NewPolicyNotFoundError(ptype)
+	}
+
+	if !assertion.HasPolicy(oldPolicy) {
+		return errors.NewPolicyNotFoundError(strings.Join(oldPolicy, ", "))
+	}
+
+	assertion.RemovePolicy(oldPolicy)
+	assertion.AddPolicy(newPolicy)
+
+	if p.adapter != nil {
+		oldLine := ptype + ", " + strings.Join(oldPolicy, ", ")
+		newLine := ptype + ", " + strings.Join(newPolicy, ", ")
+		if ua, ok := p.adapter.(UpdatableAdapter); ok {
+			if err := ua.UpdatePolicy(oldLine, newLine); err != nil {
+				assertion.RemovePolicy(newPolicy)
+				assertion.AddPolicy(oldPolicy)
+				return errors.WrapError("UpdatePolicy", err)
+			}
+		} else {
+			_ = p.adapter.RemovePolicy(oldLine)
+			_ = p.adapter.AddPolicy(newLine)
+		}
+	}
+
+	p.cache.Invalidate(ptype)
+	p.logger.InfoKV("Policy updated", "type", ptype)
+	return nil
+}
+
+func (p *Policy) UpdatePolicies(sec, ptype string, oldPolicies, newPolicies [][]string) error {
+	assertion := p.model.GetAssertion(ptype)
+	if assertion == nil {
+		return errors.NewPolicyNotFoundError(ptype)
+	}
+
+	for _, old := range oldPolicies {
+		assertion.RemovePolicy(old)
+	}
+	for _, newP := range newPolicies {
+		assertion.AddPolicy(newP)
+	}
+
+	if p.adapter != nil {
+		if ua, ok := p.adapter.(UpdatableAdapter); ok {
+			var oldLines, newLines []string
+			for i, old := range oldPolicies {
+				oldLines = append(oldLines, ptype+", "+strings.Join(old, ", "))
+				newLines = append(newLines, ptype+", "+strings.Join(newPolicies[i], ", "))
+			}
+			if err := ua.UpdatePolicies(oldLines, newLines); err != nil {
+				return errors.WrapError("UpdatePolicies", err)
+			}
+		} else {
+			for _, old := range oldPolicies {
+				_ = p.adapter.RemovePolicy(ptype + ", " + strings.Join(old, ", "))
+			}
+			for _, newP := range newPolicies {
+				_ = p.adapter.AddPolicy(ptype + ", " + strings.Join(newP, ", "))
+			}
+		}
+	}
+
+	p.cache.Invalidate(ptype)
+	p.logger.InfoKV("Policies updated", "type", ptype, "count", len(oldPolicies))
+	return nil
+}
+
+func (p *Policy) GetFilteredPolicy(ptype string, fieldIndex int, fieldValues ...string) [][]string {
+	assertion := p.model.GetAssertion(ptype)
+	if assertion == nil {
+		return nil
+	}
+
+	var result [][]string
+	for _, policy := range assertion.Policies {
+		match := true
+		for i, value := range fieldValues {
+			if fieldIndex+i < len(policy) && policy[fieldIndex+i] != value {
+				match = false
+				break
+			}
+		}
+		if match {
+			result = append(result, policy)
+		}
+	}
+	return result
+}
+
+func (p *Policy) GetAllPolicies(ptype string) [][]string {
+	assertion := p.model.GetAssertion(ptype)
+	if assertion == nil {
+		return nil
+	}
+	return assertion.Policies
+}
+
+func (p *Policy) HasPolicy(ptype string, policy []string) bool {
+	assertion := p.model.GetAssertion(ptype)
+	if assertion == nil {
+		return false
+	}
+	return assertion.HasPolicy(policy)
+}
+
+func (p *Policy) GetAllSubjects() []string {
+	return p.getAllFieldValues(model.SectionPolicyDefinition, 0)
+}
+
+func (p *Policy) GetAllObjects() []string {
+	return p.getAllFieldValues(model.SectionPolicyDefinition, 1)
+}
+
+func (p *Policy) GetAllActions() []string {
+	return p.getAllFieldValues(model.SectionPolicyDefinition, 2)
+}
+
+func (p *Policy) GetAllRoles() []string {
+	return p.getAllFieldValues(model.SectionRoleDefinition, 1)
+}
+
+func (p *Policy) GetAllUsers() []string {
+	return p.getAllFieldValues(model.SectionRoleDefinition, 0)
+}
+
+func (p *Policy) getAllFieldValues(section string, fieldIndex int) []string {
+	seen := make(map[string]bool)
+	var result []string
+
+	for key, assertion := range p.model.GetAssertions() {
+		if strings.HasPrefix(key, section) {
+			for _, policy := range assertion.Policies {
+				if fieldIndex < len(policy) {
+					val := policy[fieldIndex]
+					if !seen[val] {
+						seen[val] = true
+						result = append(result, val)
+					}
+				}
+			}
+		}
+	}
+	return result
+}
+
+func (p *Policy) addPolicyInternal(line string) {
+	tokens := strings.Split(line, ",")
+	for i := range tokens {
+		tokens[i] = strings.TrimSpace(tokens[i])
+	}
+
+	if len(tokens) < 2 {
+		return
+	}
+
+	ptype := tokens[0]
+	policy := tokens[1:]
+
+	assertion := p.model.GetAssertion(ptype)
+	if assertion != nil {
+		assertion.AddPolicy(policy)
+	}
+}
+
+func (p *Policy) SetAdapter(adapter Adapter) {
+	p.adapter = adapter
+}
+
+func (p *Policy) GetAdapter() Adapter {
+	return p.adapter
+}
+
+func (p *Policy) GetCache() *PolicyCache {
+	return p.cache
+}
