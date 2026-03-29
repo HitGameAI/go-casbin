@@ -18,11 +18,11 @@ import (
 )
 
 const (
-	SectionRequestDefinition  = "r"
-	SectionPolicyDefinition   = "p"
-	SectionRoleDefinition     = "g"
-	SectionPolicyEffect       = "e"
-	SectionMatchers           = "m"
+	SectionRequestDefinition = "r"
+	SectionPolicyDefinition  = "p"
+	SectionRoleDefinition    = "g"
+	SectionPolicyEffect      = "e"
+	SectionMatchers          = "m"
 )
 
 type Assertion struct {
@@ -53,7 +53,7 @@ func (a *Assertion) buildTokens() {
 	for _, p := range parts {
 		t := strings.TrimSpace(p)
 		if t != "" {
-			a.Tokens = append(a.Tokens, t)
+			a.Tokens = append(a.Tokens, a.Key+"."+t)
 		}
 	}
 }

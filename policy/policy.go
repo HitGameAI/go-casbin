@@ -282,6 +282,10 @@ func (p *Policy) RemovePolicies(sec, ptype string, rules [][]string) error {
 	return nil
 }
 
+// RemoveFilteredPolicy 按字段索引和值过滤删除策略
+// 从内存模型中删除所有匹配 fieldIndex 位置开始的 fieldValues 的策略
+// 如果适配器支持 UpdatableAdapter，使用 UpdateFilteredPolicies 高效更新
+// 否则逐条调用 RemovePolicy
 func (p *Policy) RemoveFilteredPolicy(sec, ptype string, fieldIndex int, fieldValues ...string) error {
 	assertion := p.model.GetAssertion(ptype)
 	if assertion == nil {
@@ -337,6 +341,8 @@ func (p *Policy) RemoveFilteredPolicy(sec, ptype string, fieldIndex int, fieldVa
 	return nil
 }
 
+// UpdatePolicy 更新单条策略（旧策略替换为新策略）
+// 如果适配器写入失败，会回滚内存中的策略
 func (p *Policy) UpdatePolicy(sec, ptype string, oldPolicy, newPolicy []string) error {
 	assertion := p.model.GetAssertion(ptype)
 	if assertion == nil {
@@ -370,6 +376,8 @@ func (p *Policy) UpdatePolicy(sec, ptype string, oldPolicy, newPolicy []string) 
 	return nil
 }
 
+// UpdatePolicies 批量更新策略
+// 先删除旧策略，再添加新策略，支持适配器回退
 func (p *Policy) UpdatePolicies(sec, ptype string, oldPolicies, newPolicies [][]string) error {
 	assertion := p.model.GetAssertion(ptype)
 	if assertion == nil {
@@ -408,6 +416,7 @@ func (p *Policy) UpdatePolicies(sec, ptype string, oldPolicies, newPolicies [][]
 	return nil
 }
 
+// GetFilteredPolicy 按字段索引和值过滤获取策略列表
 func (p *Policy) GetFilteredPolicy(ptype string, fieldIndex int, fieldValues ...string) [][]string {
 	assertion := p.model.GetAssertion(ptype)
 	if assertion == nil {
@@ -430,6 +439,7 @@ func (p *Policy) GetFilteredPolicy(ptype string, fieldIndex int, fieldValues ...
 	return result
 }
 
+// GetAllPolicies 获取指定类型的所有策略
 func (p *Policy) GetAllPolicies(ptype string) [][]string {
 	assertion := p.model.GetAssertion(ptype)
 	if assertion == nil {
@@ -438,6 +448,7 @@ func (p *Policy) GetAllPolicies(ptype string) [][]string {
 	return assertion.Policies
 }
 
+// HasPolicy 检查指定类型的策略是否存在
 func (p *Policy) HasPolicy(ptype string, policy []string) bool {
 	assertion := p.model.GetAssertion(ptype)
 	if assertion == nil {
@@ -446,26 +457,32 @@ func (p *Policy) HasPolicy(ptype string, policy []string) bool {
 	return assertion.HasPolicy(policy)
 }
 
+// GetAllSubjects 获取所有策略主体（p 段第 0 个字段）
 func (p *Policy) GetAllSubjects() []string {
 	return p.getAllFieldValues(model.SectionPolicyDefinition, 0)
 }
 
+// GetAllObjects 获取所有策略资源（p 段第 1 个字段）
 func (p *Policy) GetAllObjects() []string {
 	return p.getAllFieldValues(model.SectionPolicyDefinition, 1)
 }
 
+// GetAllActions 获取所有策略操作（p 段第 2 个字段）
 func (p *Policy) GetAllActions() []string {
 	return p.getAllFieldValues(model.SectionPolicyDefinition, 2)
 }
 
+// GetAllRoles 获取所有角色（g 段第 1 个字段）
 func (p *Policy) GetAllRoles() []string {
 	return p.getAllFieldValues(model.SectionRoleDefinition, 1)
 }
 
+// GetAllUsers 获取所有用户（g 段第 0 个字段）
 func (p *Policy) GetAllUsers() []string {
 	return p.getAllFieldValues(model.SectionRoleDefinition, 0)
 }
 
+// getAllFieldValues 从指定段的所有断言中提取指定字段的去重值列表
 func (p *Policy) getAllFieldValues(section string, fieldIndex int) []string {
 	seen := make(map[string]bool)
 	var result []string
@@ -486,11 +503,11 @@ func (p *Policy) getAllFieldValues(section string, fieldIndex int) []string {
 	return result
 }
 
+// addPolicyInternal 内部方法：解析策略行并添加到模型
+// 策略行格式为 "p, alice, data1, read"，解析后添加到对应类型的断言中
+// 支持括号内包含逗号的表达式，如 r.sub in ("alice", "bob")
 func (p *Policy) addPolicyInternal(line string) {
-	tokens := strings.Split(line, ",")
-	for i := range tokens {
-		tokens[i] = strings.TrimSpace(tokens[i])
-	}
+	tokens := splitPolicyLine(line)
 
 	if len(tokens) < 2 {
 		return
@@ -505,14 +522,48 @@ func (p *Policy) addPolicyInternal(line string) {
 	}
 }
 
+// splitPolicyLine 智能分割策略行
+// 只分割顶层逗号，忽略括号内的逗号
+// 例如：p, r.sub in ("alice", "bob"), data4, read
+// → ["p", "r.sub in (\"alice\", \"bob\")", "data4", "read"]
+func splitPolicyLine(line string) []string {
+	var tokens []string
+	var current strings.Builder
+	depth := 0
+
+	for _, ch := range line {
+		if ch == '(' || ch == '[' || ch == '{' {
+			depth++
+			current.WriteRune(ch)
+		} else if ch == ')' || ch == ']' || ch == '}' {
+			depth--
+			current.WriteRune(ch)
+		} else if ch == ',' && depth == 0 {
+			tokens = append(tokens, strings.TrimSpace(current.String()))
+			current.Reset()
+		} else {
+			current.WriteRune(ch)
+		}
+	}
+
+	if current.Len() > 0 {
+		tokens = append(tokens, strings.TrimSpace(current.String()))
+	}
+
+	return tokens
+}
+
+// SetAdapter 设置策略存储适配器
 func (p *Policy) SetAdapter(adapter Adapter) {
 	p.adapter = adapter
 }
 
+// GetAdapter 获取当前策略存储适配器
 func (p *Policy) GetAdapter() Adapter {
 	return p.adapter
 }
 
+// GetCache 获取策略缓存
 func (p *Policy) GetCache() *PolicyCache {
 	return p.cache
 }

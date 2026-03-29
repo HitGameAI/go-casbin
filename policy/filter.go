@@ -14,14 +14,16 @@ package policy
 import "strings"
 
 // Filter 策略过滤器（所有适配器共用）
+// 用于按策略类型和字段值过滤策略，支持链式调用构建过滤条件
+// 字段映射：PType=策略类型, V0=主体, V1=资源/角色, V2=操作, V3=效果, V4/V5=扩展
 type Filter struct {
-	PType string
-	V0    string
-	V1    string
-	V2    string
-	V3    string
-	V4    string
-	V5    string
+	PType string // 策略类型（p/g/p2/g2 等）
+	V0    string // 第一个字段值（通常为主体 Subject）
+	V1    string // 第二个字段值（通常为资源 Object 或角色 Role）
+	V2    string // 第三个字段值（通常为操作 Action）
+	V3    string // 第四个字段值（通常为效果 Effect 或域 Domain）
+	V4    string // 第五个字段值（扩展字段）
+	V5    string // 第六个字段值（扩展字段）
 }
 
 // NewFilter 创建过滤器
@@ -29,16 +31,17 @@ func NewFilter() *Filter {
 	return &Filter{}
 }
 
-// 链式设置方法
-func (f *Filter) WithPType(v string) *Filter { f.PType = v; return f }
-func (f *Filter) WithV0(v string) *Filter    { f.V0 = v; return f }
-func (f *Filter) WithV1(v string) *Filter    { f.V1 = v; return f }
-func (f *Filter) WithV2(v string) *Filter    { f.V2 = v; return f }
-func (f *Filter) WithV3(v string) *Filter    { f.V3 = v; return f }
-func (f *Filter) WithV4(v string) *Filter    { f.V4 = v; return f }
-func (f *Filter) WithV5(v string) *Filter    { f.V5 = v; return f }
+// 链式设置方法，用于流畅地构建过滤条件
+// 示例：NewFilter().WithPType("p").WithV0("alice").WithV1("data1")
+func (f *Filter) WithPType(v string) *Filter { f.PType = v; return f } // 设置策略类型
+func (f *Filter) WithV0(v string) *Filter    { f.V0 = v; return f }    // 设置主体字段
+func (f *Filter) WithV1(v string) *Filter    { f.V1 = v; return f }    // 设置资源/角色字段
+func (f *Filter) WithV2(v string) *Filter    { f.V2 = v; return f }    // 设置操作字段
+func (f *Filter) WithV3(v string) *Filter    { f.V3 = v; return f }    // 设置效果/域字段
+func (f *Filter) WithV4(v string) *Filter    { f.V4 = v; return f }    // 设置扩展字段
+func (f *Filter) WithV5(v string) *Filter    { f.V5 = v; return f }    // 设置扩展字段
 
-// Values 返回 V0-V5 字段值列表
+// Values 返回 V0-V5 字段值列表（不含 PType）
 func (f *Filter) Values() []string {
 	return []string{f.V0, f.V1, f.V2, f.V3, f.V4, f.V5}
 }
@@ -49,6 +52,7 @@ func (f *Filter) AllValues() []string {
 }
 
 // NonEmptyFields 返回非空字段的 map（字段名 -> 值）
+// 用于构建 SQL WHERE 条件或 Redis 查询条件
 func (f *Filter) NonEmptyFields() map[string]string {
 	result := make(map[string]string)
 	if f.PType != "" {
@@ -62,12 +66,13 @@ func (f *Filter) NonEmptyFields() map[string]string {
 	return result
 }
 
-// IsEmpty 检查过滤器是否为空
+// IsEmpty 检查过滤器是否为空（所有字段都为空字符串）
 func (f *Filter) IsEmpty() bool {
 	return f.PType == "" && f.V0 == "" && f.V1 == "" && f.V2 == "" && f.V3 == "" && f.V4 == "" && f.V5 == ""
 }
 
 // FromSlice 从字符串切片创建过滤器
+// 切片顺序：[PType, V0, V1, V2, V3, V4, V5]
 func (f *Filter) FromSlice(values []string) *Filter {
 	if len(values) > 0 {
 		f.PType = values[0]
@@ -93,12 +98,14 @@ func (f *Filter) FromSlice(values []string) *Filter {
 	return f
 }
 
-// FilterFromSlice 从字符串切片创建过滤器
+// FilterFromSlice 从字符串切片创建过滤器（工厂函数）
 func FilterFromSlice(values []string) *Filter {
 	return NewFilter().FromSlice(values)
 }
 
 // Match 检查策略行是否匹配过滤器
+// 将策略行按逗号分割后，逐字段与过滤器的非空字段比较
+// 空字段视为通配，不参与匹配
 func (f *Filter) Match(line string) bool {
 	parts := strings.Split(line, ",")
 	for i := range parts {
@@ -118,6 +125,8 @@ func (f *Filter) Match(line string) bool {
 }
 
 // MatchByIndex 根据字段索引检查策略行是否匹配
+// fieldIndex 为起始字段位置，fieldValues 为从该位置开始的连续字段值
+// 常用于按主体/资源等特定字段过滤
 func MatchByIndex(line string, fieldIndex int, fieldValues ...string) bool {
 	parts := strings.Split(line, ",")
 	for i := range parts {
@@ -134,6 +143,7 @@ func MatchByIndex(line string, fieldIndex int, fieldValues ...string) bool {
 }
 
 // FilterPolicies 使用过滤器过滤策略列表
+// 如果过滤器为空或所有字段都为空，返回原始列表
 func FilterPolicies(policies []string, filter *Filter) []string {
 	if filter == nil || filter.IsEmpty() {
 		return policies
@@ -149,6 +159,7 @@ func FilterPolicies(policies []string, filter *Filter) []string {
 }
 
 // FilterPoliciesByIndex 根据字段索引过滤策略列表
+// 从 fieldIndex 位置开始，逐个比较 fieldValues
 func FilterPoliciesByIndex(policies []string, fieldIndex int, fieldValues ...string) []string {
 	if len(fieldValues) == 0 {
 		return policies
@@ -163,7 +174,8 @@ func FilterPoliciesByIndex(policies []string, fieldIndex int, fieldValues ...str
 	return result
 }
 
-// ExtractPType 从策略行提取 PType
+// ExtractPType 从策略行提取 PType（策略类型）
+// 策略行格式为 "p, alice, data1, read"，提取第一个逗号前的部分
 func ExtractPType(line string) string {
 	parts := strings.SplitN(line, ",", 2)
 	if len(parts) > 0 {

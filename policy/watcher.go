@@ -21,20 +21,29 @@ import (
 	"github.com/kamalyes/go-toolbox/pkg/syncx"
 )
 
+// WatcherCallback 策略文件变更回调函数
 type WatcherCallback func()
 
+// PolicyWatcher 策略文件变更监控器
+// 通过定时检查文件修改时间来检测策略文件变更
+// 文件变更后触发所有注册的回调函数（通常执行 ReloadPolicy）
+// 适用于单机文件适配器场景，分布式场景请使用 PolicyNotifier
 type PolicyWatcher struct {
-	filePath    string
-	interval    time.Duration
-	callbacks   []WatcherCallback
-	stopCh      chan struct{}
-	workerPool  *syncx.WorkerPool
-	logger      logger.ILogger
-	mu          sync.Mutex
-	lastModTime time.Time
-	running     bool
+	filePath    string            // 监控的策略文件路径
+	interval    time.Duration     // 检查间隔
+	callbacks   []WatcherCallback // 变更回调列表
+	stopCh      chan struct{}     // 停止信号通道
+	workerPool  *syncx.WorkerPool // 协程池（并发执行回调）
+	logger      logger.ILogger    // 日志记录器
+	mu          sync.Mutex        // 保护 callbacks 和 running
+	lastModTime time.Time         // 上次文件修改时间
+	running     bool              // 是否正在运行
 }
 
+// NewPolicyWatcher 创建策略文件变更监控器
+// filePath: 策略文件路径
+// interval: 检查间隔，默认 200ms
+// log: 日志记录器
 func NewPolicyWatcher(filePath string, interval time.Duration, log logger.ILogger) *PolicyWatcher {
 	return &PolicyWatcher{
 		filePath:   filePath,
@@ -46,12 +55,15 @@ func NewPolicyWatcher(filePath string, interval time.Duration, log logger.ILogge
 	}
 }
 
+// AddCallback 注册策略变更回调函数
 func (pw *PolicyWatcher) AddCallback(cb WatcherCallback) {
 	pw.mu.Lock()
 	defer pw.mu.Unlock()
 	pw.callbacks = append(pw.callbacks, cb)
 }
 
+// Start 启动文件变更监控
+// 记录初始修改时间，启动后台监控循环
 func (pw *PolicyWatcher) Start() error {
 	pw.mu.Lock()
 	if pw.running {
@@ -72,6 +84,7 @@ func (pw *PolicyWatcher) Start() error {
 	return nil
 }
 
+// Stop 停止文件变更监控
 func (pw *PolicyWatcher) Stop() {
 	pw.mu.Lock()
 	defer pw.mu.Unlock()
@@ -86,6 +99,7 @@ func (pw *PolicyWatcher) Stop() {
 	pw.logger.InfoMsg("Policy watcher stopped")
 }
 
+// watchLoop 监控循环，定时检查文件修改时间
 func (pw *PolicyWatcher) watchLoop() {
 	ticker := time.NewTicker(pw.interval)
 	defer ticker.Stop()
@@ -100,6 +114,8 @@ func (pw *PolicyWatcher) watchLoop() {
 	}
 }
 
+// checkFileChange 检查文件是否发生变更
+// 如果文件修改时间晚于上次记录，则触发所有回调
 func (pw *PolicyWatcher) checkFileChange() {
 	info, err := os.Stat(pw.filePath)
 	if err != nil {

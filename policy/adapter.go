@@ -13,6 +13,7 @@ package policy
 
 import (
 	"bufio"
+	"context"
 	"os"
 	"strings"
 
@@ -54,6 +55,56 @@ type UpdatableAdapter interface {
 	UpdatePolicy(oldLine, newLine string) error                                            // 更新单条策略
 	UpdatePolicies(oldLines, newLines []string) error                                      // 批量更新策略
 	UpdateFilteredPolicies(newLines []string, fieldIndex int, fieldValues ...string) error // 按过滤条件更新策略
+}
+
+// ==================== 带 Context 的适配器接口 ====================
+// 以下接口为适配器提供 context.Context 支持，用于超时控制和分布式链路追踪
+// 适配器可同时实现非 ctx 和 WithCtx 两套接口，非 ctx 方法内部调用 WithCtx 并传入 context.Background()
+
+// ContextAdapter 支持 Context 的基础适配器接口
+// 扩展 Adapter，增加带 context 的 CRUD 方法
+// 适用于需要超时控制、链路追踪或请求取消的场景
+type ContextAdapter interface {
+	Adapter
+	LoadPolicyWithCtx(ctx context.Context) ([]string, error)        // 带上下文从存储加载所有策略
+	SavePolicyWithCtx(ctx context.Context, policies []string) error // 带上下文保存所有策略到存储
+	AddPolicyWithCtx(ctx context.Context, line string) error        // 带上下文添加单条策略
+	RemovePolicyWithCtx(ctx context.Context, line string) error     // 带上下文删除单条策略
+}
+
+// FilteredContextAdapter 支持 Context 和过滤加载的适配器接口
+// 扩展 ContextAdapter，增加带上下文的过滤加载能力
+type FilteredContextAdapter interface {
+	ContextAdapter
+	LoadFilteredPolicyWithCtx(ctx context.Context, filter interface{}) ([]string, error) // 带上下文按过滤条件加载策略
+	IsFiltered() bool                                                                    // 返回是否已使用过滤加载
+}
+
+// BatchContextAdapter 支持 Context 和批量操作的适配器接口
+// 扩展 ContextAdapter，增加带上下文的批量操作能力
+type BatchContextAdapter interface {
+	ContextAdapter
+	AddPoliciesWithCtx(ctx context.Context, lines []string) error    // 带上下文批量添加策略
+	RemovePoliciesWithCtx(ctx context.Context, lines []string) error // 带上下文批量删除策略
+}
+
+// UpdatableContextAdapter 支持 Context 和更新操作的适配器接口
+// 扩展 ContextAdapter，增加带上下文的策略更新能力
+type UpdatableContextAdapter interface {
+	ContextAdapter
+	UpdatePolicyWithCtx(ctx context.Context, oldLine, newLine string) error                                            // 带上下文更新单条策略
+	UpdatePoliciesWithCtx(ctx context.Context, oldLines, newLines []string) error                                      // 带上下文批量更新策略
+	UpdateFilteredPoliciesWithCtx(ctx context.Context, newLines []string, fieldIndex int, fieldValues ...string) error // 带上下文按过滤条件更新策略
+}
+
+// FullAdapter 全功能适配器接口
+// 组合了所有适配器接口（含 WithCtx），表示适配器支持全部操作能力
+// GORM 适配器和 Redis 适配器均实现了此接口
+type FullAdapter interface {
+	ContextAdapter
+	FilteredContextAdapter
+	BatchContextAdapter
+	UpdatableContextAdapter
 }
 
 // ==================== 文件适配器 ====================

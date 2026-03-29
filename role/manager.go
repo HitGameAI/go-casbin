@@ -19,13 +19,31 @@ import (
 	"github.com/kamalyes/go-toolbox/pkg/syncx"
 )
 
+// RoleManager 角色管理器
+// 在 RoleHierarchy 之上封装了缓存层和域支持，提供完整的 RBAC 角色管理能力
+//
+// 核心特性：
+//   - 域隔离：通过 domain 参数实现多租户角色隔离（键格式 "domain:name"）
+//   - 缓存加速：基于 syncx.Map 缓存 HasLink 查询结果，避免重复 DFS 遍历
+//   - 隐式查询：GetImplicitRoles/GetImplicitUsers 递归获取所有间接继承关系
+//   - 深度限制：maxDepth 防止递归查询过深导致性能问题
+//
+// 使用方式：
+//
+//	rm := NewRoleManager(log)
+//	rm.AddLink("alice", "admin")                    // alice 继承 admin
+//	rm.AddLink("alice", "editor", "tenant1")        // alice 在 tenant1 继承 editor
+//	ok := rm.HasLink("alice", "viewer")             // 检查 alice 是否继承 viewer
+//	roles := rm.GetImplicitRoles("alice")           // 获取 alice 的所有间接角色
 type RoleManager struct {
-	hierarchy *RoleHierarchy
-	cache     syncx.Map[string, bool]
-	logger    logger.ILogger
-	maxDepth  int
+	hierarchy *RoleHierarchy          // 角色层级管理器（继承关系图）
+	cache     syncx.Map[string, bool] // 缓存层（key="name1->name2" 或 "domain:name1->name2"）
+	logger    logger.ILogger          // 日志记录器
+	maxDepth  int                     // 递归查询最大深度（默认 10，防止无限递归）
 }
 
+// NewRoleManager 创建角色管理器
+// log: 日志记录器，用于记录角色操作
 func NewRoleManager(log logger.ILogger) *RoleManager {
 	return &RoleManager{
 		hierarchy: NewRoleHierarchy(log),
@@ -34,6 +52,10 @@ func NewRoleManager(log logger.ILogger) *RoleManager {
 	}
 }
 
+// AddLink 添加角色继承链接（支持域隔离）
+// name1 继承 name2，可选指定 domain 实现多租户隔离
+// 添加成功后自动失效相关缓存
+// domain: 可选，指定租户域（如 "tenant1"）
 func (rm *RoleManager) AddLink(name1, name2 string, domain ...string) error {
 	n1 := rm.buildKey(name1, domain)
 	n2 := rm.buildKey(name2, domain)
@@ -47,6 +69,8 @@ func (rm *RoleManager) AddLink(name1, name2 string, domain ...string) error {
 	return nil
 }
 
+// DeleteLink 删除角色继承链接（支持域隔离）
+// 删除后自动失效相关缓存
 func (rm *RoleManager) DeleteLink(name1, name2 string, domain ...string) {
 	n1 := rm.buildKey(name1, domain)
 	n2 := rm.buildKey(name2, domain)
@@ -56,6 +80,9 @@ func (rm *RoleManager) DeleteLink(name1, name2 string, domain ...string) {
 	rm.logger.InfoKV("Role link deleted", "name1", name1, "name2", name2)
 }
 
+// HasLink 检查角色继承关系（含间接继承，支持域隔离和缓存）
+// 优先从缓存读取结果，缓存未命中时委托给 RoleHierarchy 进行 DFS 查询
+// 查询结果会写入缓存，后续相同查询直接命中缓存
 func (rm *RoleManager) HasLink(name1, name2 string, domain ...string) bool {
 	cacheKey := rm.buildCacheKey(name1, name2, domain...)
 	if result, ok := rm.cache.Load(cacheKey); ok {
@@ -70,6 +97,8 @@ func (rm *RoleManager) HasLink(name1, name2 string, domain ...string) bool {
 	return result
 }
 
+// GetRoles 获取角色直接继承的角色列表（支持域隔离）
+// 返回结果已去除域前缀，只保留角色名称
 func (rm *RoleManager) GetRoles(name string, domain ...string) []string {
 	n := rm.buildKey(name, domain)
 	roles := rm.hierarchy.GetRoles(n)
@@ -81,6 +110,8 @@ func (rm *RoleManager) GetRoles(name string, domain ...string) []string {
 	return result
 }
 
+// GetUsers 获取继承指定角色的所有用户（支持域隔离）
+// 反向查询：找出所有直接继承 name 角色的角色
 func (rm *RoleManager) GetUsers(name string, domain ...string) []string {
 	n := rm.buildKey(name, domain)
 	users := rm.hierarchy.GetUsers(n)
@@ -92,6 +123,9 @@ func (rm *RoleManager) GetUsers(name string, domain ...string) []string {
 	return result
 }
 
+// GetImplicitRoles 递归获取所有间接继承的角色列表（支持域隔离）
+// 例如：alice → admin → editor → viewer，返回 ["admin", "editor", "viewer"]
+// 受 maxDepth 限制，防止无限递归
 func (rm *RoleManager) GetImplicitRoles(name string, domain ...string) []string {
 	visited := make(map[string]bool)
 	var result []string
@@ -104,6 +138,8 @@ func (rm *RoleManager) GetImplicitRoles(name string, domain ...string) []string 
 	return implicit
 }
 
+// GetImplicitUsers 递归获取所有间接继承指定角色的用户列表（支持域隔离）
+// 反向递归：找出所有直接或间接继承 name 角色的用户
 func (rm *RoleManager) GetImplicitUsers(name string, domain ...string) []string {
 	visited := make(map[string]bool)
 	var result []string
@@ -116,14 +152,18 @@ func (rm *RoleManager) GetImplicitUsers(name string, domain ...string) []string 
 	return implicit
 }
 
+// GetDomains 获取指定角色所属的所有域
 func (rm *RoleManager) GetDomains(name string) []string {
 	return rm.hierarchy.GetDomains(name)
 }
 
+// GetAllDomains 获取所有域列表
 func (rm *RoleManager) GetAllDomains() []string {
 	return rm.hierarchy.GetAllDomains()
 }
 
+// DeleteDomain 删除指定域的所有角色关系
+// 同时清理该域相关的所有缓存条目
 func (rm *RoleManager) DeleteDomain(domain string) {
 	rm.hierarchy.DeleteDomain(domain)
 	rm.cache.Range(func(key string, value bool) bool {
@@ -135,6 +175,8 @@ func (rm *RoleManager) DeleteDomain(domain string) {
 	rm.logger.InfoKV("Domain deleted", "domain", domain)
 }
 
+// Clear 清空所有角色关系和缓存
+// 通常在重新加载策略时调用
 func (rm *RoleManager) Clear() {
 	rm.hierarchy.Clear()
 	rm.cache.Range(func(key string, value bool) bool {
@@ -144,10 +186,15 @@ func (rm *RoleManager) Clear() {
 	rm.logger.DebugMsg("Role manager cleared")
 }
 
+// SetMaxDepth 设置递归查询最大深度
+// 默认值为 10，超过此深度的继承链将被截断
+// 适用于角色继承层级特别深的场景
 func (rm *RoleManager) SetMaxDepth(depth int) {
 	rm.maxDepth = depth
 }
 
+// GetHierarchy 获取底层角色层级管理器
+// 用于需要直接操作 RoleHierarchy 的场景（如批量重建角色关系）
 func (rm *RoleManager) GetHierarchy() *RoleHierarchy {
 	return rm.hierarchy
 }
