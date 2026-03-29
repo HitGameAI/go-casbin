@@ -22,12 +22,12 @@ import (
 type ChangeEventType string
 
 const (
-	EventTypePolicyAdded   ChangeEventType = "policy_added"    // 策略添加
-	EventTypePolicyRemoved ChangeEventType = "policy_removed"  // 策略删除
-	EventTypePolicyUpdated ChangeEventType = "policy_updated"  // 策略更新
-	EventTypePolicyCleared ChangeEventType = "policy_cleared"  // 策略清空
-	EventTypePolicyReload  ChangeEventType = "policy_reload"   // 策略全量重载
-	EventTypeFullSync      ChangeEventType = "full_sync"       // 全量同步（新节点加入时）
+	EventTypePolicyAdded   ChangeEventType = "policy_added"   // 策略添加
+	EventTypePolicyRemoved ChangeEventType = "policy_removed" // 策略删除
+	EventTypePolicyUpdated ChangeEventType = "policy_updated" // 策略更新
+	EventTypePolicyCleared ChangeEventType = "policy_cleared" // 策略清空
+	EventTypePolicyReload  ChangeEventType = "policy_reload"  // 策略全量重载
+	EventTypeFullSync      ChangeEventType = "full_sync"      // 全量同步（新节点加入时）
 )
 
 // ChangeEvent 策略变更事件
@@ -214,4 +214,52 @@ func (ln *LocalNotifier) Close() error {
 	close(ln.stopCh)
 	ln.handlers = nil
 	return nil
+}
+
+// ==================== 通知器辅助工具 ====================
+
+// NotifierHelper 通知器辅助工具
+// 提供通用的策略变更事件发布便捷方法，消除各通知器实现中的重复代码
+// 所有通知器（Redis/Kafka/NATS）均可组合此结构体复用发布逻辑
+//
+// 使用方式：
+//
+//	type RedisNotifier struct {
+//	    policy.NotifierHelper
+//	    client *redis.Client
+//	    // ...
+//	}
+//	// 只需实现 Publish(ctx, *ChangeEvent) error 即可
+//	// PublishPolicyAdded/Removed/Updated/Reload 自动可用
+type NotifierHelper struct {
+	Publisher func(ctx context.Context, event *ChangeEvent) error // 底层发布函数
+	Source    string                                              // 事件来源节点标识
+}
+
+// PublishPolicyAdded 发布策略添加事件
+func (h *NotifierHelper) PublishPolicyAdded(ctx context.Context, ptype string, p []string) error {
+	event := NewChangeEvent(EventTypePolicyAdded, ptype, h.Source)
+	event.NewPolicy = p
+	return h.Publisher(ctx, event)
+}
+
+// PublishPolicyRemoved 发布策略删除事件
+func (h *NotifierHelper) PublishPolicyRemoved(ctx context.Context, ptype string, oldPolicy []string) error {
+	event := NewChangeEvent(EventTypePolicyRemoved, ptype, h.Source)
+	event.OldPolicy = oldPolicy
+	return h.Publisher(ctx, event)
+}
+
+// PublishPolicyUpdated 发布策略更新事件
+func (h *NotifierHelper) PublishPolicyUpdated(ctx context.Context, ptype string, oldPolicy, newPolicy []string) error {
+	event := NewChangeEvent(EventTypePolicyUpdated, ptype, h.Source)
+	event.OldPolicy = oldPolicy
+	event.NewPolicy = newPolicy
+	return h.Publisher(ctx, event)
+}
+
+// PublishPolicyReload 发布策略全量重载事件
+func (h *NotifierHelper) PublishPolicyReload(ctx context.Context) error {
+	event := NewChangeEvent(EventTypePolicyReload, "", h.Source)
+	return h.Publisher(ctx, event)
 }
