@@ -107,6 +107,15 @@ type FullAdapter interface {
 	UpdatableContextAdapter
 }
 
+// TransactionalAdapter 支持事务的适配器接口
+// 扩展 Adapter，增加事务执行能力
+// 适配器实现此接口后，enforcer 的事务方法可以确保多个操作在同一个数据库事务中执行
+// 如果适配器不支持事务，enforcer 会回退到非事务模式
+type TransactionalAdapter interface {
+	Adapter
+	ExecuteInTransaction(ctx context.Context, fn func(Adapter) error) error
+}
+
 // ==================== 文件适配器 ====================
 
 // FileAdapter 基于文件的策略适配器

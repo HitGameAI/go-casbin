@@ -1,55 +1,7 @@
-# ============================================================
-# 多租户 RBAC 策略配置（RBAC with Domains）
-# ============================================================
-#
-# 策略格式说明：
-#   p, sub, dom, obj, act  → 权限策略：角色(sub) 在租户(dom) 下可以 操作(act) 资源(obj)
-#   g, user, role, dom     → 角色分配：用户(user) 在租户(dom) 下属于 角色(role)
-#
-# 与标准 RBAC 策略的区别：
-#   标准 RBAC：p, alice, data1, read          → 3 个字段
-#   多租户 RBAC：p, admin, tenant1, data1, read → 4 个字段（多了 dom）
-#
-#   标准 RBAC：g, alice, admin                → 2 个字段
-#   多租户 RBAC：g, alice, admin, tenant1     → 3 个字段（多了 dom）
-#
-# 匹配推演（对应 rbac_with_domains_model.conf）：
-#   m = g(r.sub, p.sub, r.dom) && r.dom == p.dom && r.obj == p.obj && r.act == p.act
-#
-#   Enforce("alice", "tenant1", "data1", "read")
-#   → g("alice", "admin", "tenant1") = true（alice 在 tenant1 属于 admin）
-#   → p: admin, tenant1, data1, read 匹配 → true
-#
-#   Enforce("alice", "tenant2", "data2", "write")
-#   → g("alice", "viewer", "tenant2") = true（alice 在 tenant2 只是 viewer）
-#   → viewer 在 tenant2 只有 data2 的 read 权限，没有 write → false
-#
-#   Enforce("alice", "tenant2", "data2", "read")
-#   → g("alice", "viewer", "tenant2") = true
-#   → p: viewer, tenant2, data2, read 匹配 → true
-# ============================================================
-
-# 权限策略（p 行）
-# 格式：p, 角色, 租户, 资源, 操作
-
-# tenant1 的 admin 可以读写 data1
 p, admin, tenant1, data1, read
 p, admin, tenant1, data1, write
-
-# tenant2 的 admin 可以读 data2
 p, admin, tenant2, data2, read
-
-# tenant2 的 viewer 只能读 data2
 p, viewer, tenant2, data2, read
-
-# 角色分配（g 行）
-# 格式：g, 用户, 角色, 租户
-
-# alice 在 tenant1 是 admin
 g, alice, admin, tenant1
-
-# alice 在 tenant2 只是 viewer
 g, alice, viewer, tenant2
-
-# bob 在 tenant1 是 viewer
 g, bob, viewer, tenant1

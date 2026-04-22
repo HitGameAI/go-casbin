@@ -116,6 +116,8 @@ func NewEnforcer(opts ...Option) (*Enforcer, error) {
 		customFuncs:        make(map[string]BuiltinFunc),
 	}
 
+	e.registerBuiltinFunctions()
+
 	if o.modelPath != "" {
 		m, err := model.NewModelFromPath(o.modelPath, o.logger)
 		if err != nil {
@@ -328,10 +330,12 @@ func (e *Enforcer) enforceWithMatcherExpr(matcherExpr string, rvals ...interface
 	}
 
 	mc := &MatchContext{
-		Request:   request,
-		Policies:  policyAssertion.Policies,
-		RoleMgr:   e.roleMgr,
-		Assertion: policyAssertion,
+		Request:       request,
+		Policies:      policyAssertion.Policies,
+		RoleMgr:       e.roleMgr,
+		Assertion:     policyAssertion,
+		CustomFuncs:   e.customFuncs,
+		ExtraPolicies: e.buildExtraPolicies("p"),
 	}
 
 	matched, matchedEffects, err := e.matcher.Match(mc, expr)
@@ -377,24 +381,48 @@ func (e *Enforcer) enforceExWithMatcherExpr(matcherExpr string, rvals ...interfa
 		return false, nil, errors.NewPolicyNotFoundError("p")
 	}
 
-	for i, p := range policyAssertion.Policies {
-		vars := e.matcher.buildVariableMap(request, p, policyAssertion)
-		exprToEval := expr
-		if strings.Contains(exprToEval, "eval(") {
-			exprToEval = e.matcher.expandEval(exprToEval, vars)
-		}
-		if e.matcher.evalExpr(exprToEval, vars, e.roleMgr) {
-			return true, p, nil
-		}
-		_ = i
+	mc := &MatchContext{
+		Request:       request,
+		Policies:      policyAssertion.Policies,
+		RoleMgr:       e.roleMgr,
+		Assertion:     policyAssertion,
+		CustomFuncs:   e.customFuncs,
+		ExtraPolicies: e.buildExtraPolicies("p"),
 	}
 
-	return false, nil, nil
+	matched, matchedEffects, err := e.matcher.Match(mc, expr)
+	if err != nil {
+		return false, nil, errors.WrapError("matcher execution failed", err)
+	}
+
+	if !matched {
+		return false, nil, nil
+	}
+
+	var matchedPolicy []string
+	if len(matchedEffects) > 0 {
+		matchedPolicy = matchedEffects
+	}
+	return true, matchedPolicy, nil
 }
 
 // ==================== Custom Function ====================
 
 // ==================== 自定义函数 API ====================
+
+func (e *Enforcer) registerBuiltinFunctions() {
+	builtins := map[string]BuiltinFunc{
+		"keyMatch":   KeyMatchFunc,
+		"keyMatch2":  KeyMatch2Func,
+		"keyMatch3":  KeyMatch3Func,
+		"regexMatch": RegexMatchFunc,
+		"ipMatch":    IPMatchFunc,
+		"globMatch":  GlobMatchFunc,
+	}
+	for name, fn := range builtins {
+		e.customFuncs[name] = fn
+	}
+}
 
 // AddFunction 添加自定义匹配函数
 // 自定义函数可在 matcher 表达式中使用，扩展匹配能力
@@ -475,7 +503,20 @@ func (e *Enforcer) AddPoliciesEx(rules [][]string) error {
 func (e *Enforcer) AddNamedPolicy(ptype string, params ...string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.policy.AddPolicy(model.SectionPolicyDefinition, ptype, params)
+
+	if err := e.policy.AddPolicy(model.SectionPolicyDefinition, ptype, params); err != nil {
+		return err
+	}
+
+	if e.autoSave && e.policy.GetAdapter() != nil {
+		line := ptype + ", " + strings.Join(params, ", ")
+		if err := e.policy.GetAdapter().AddPolicy(line); err != nil {
+			return errors.WrapError("auto-save named policy", err)
+		}
+	}
+
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, ptype, nil, params)
+	return nil
 }
 
 // AddNamedPolicies 批量添加指定类型的策略规则
@@ -551,7 +592,20 @@ func (e *Enforcer) RemoveFilteredPolicy(fieldIndex int, fieldValues ...string) e
 func (e *Enforcer) RemoveNamedPolicy(ptype string, params ...string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.policy.RemovePolicy(model.SectionPolicyDefinition, ptype, params)
+
+	if err := e.policy.RemovePolicy(model.SectionPolicyDefinition, ptype, params); err != nil {
+		return err
+	}
+
+	if e.autoSave && e.policy.GetAdapter() != nil {
+		line := ptype + ", " + strings.Join(params, ", ")
+		if err := e.policy.GetAdapter().RemovePolicy(line); err != nil {
+			return errors.WrapError("auto-save remove named policy", err)
+		}
+	}
+
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, ptype, params, nil)
+	return nil
 }
 
 // RemoveNamedPolicies 批量删除指定类型的策略规则
@@ -613,7 +667,11 @@ func (e *Enforcer) AddGroupingPolicy(params ...string) error {
 	}
 
 	if len(params) >= 2 && e.autoBuildRoleLinks {
-		if err := e.roleMgr.AddLink(params[0], params[1]); err != nil {
+		domain := make([]string, 0)
+		if len(params) >= 3 {
+			domain = append(domain, params[2])
+		}
+		if err := e.roleMgr.AddLink(params[0], params[1], domain...); err != nil {
 			return err
 		}
 	}
@@ -624,6 +682,8 @@ func (e *Enforcer) AddGroupingPolicy(params ...string) error {
 			return errors.WrapError("auto-save grouping policy", err)
 		}
 	}
+
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, "g", nil, params)
 
 	return nil
 }
@@ -640,10 +700,28 @@ func (e *Enforcer) AddGroupingPolicies(rules [][]string) error {
 	if e.autoBuildRoleLinks {
 		for _, rule := range rules {
 			if len(rule) >= 2 {
-				_ = e.roleMgr.AddLink(rule[0], rule[1])
+				domain := make([]string, 0)
+				if len(rule) >= 3 {
+					domain = append(domain, rule[2])
+				}
+				_ = e.roleMgr.AddLink(rule[0], rule[1], domain...)
 			}
 		}
 	}
+
+	if e.autoSave && e.policy.GetAdapter() != nil {
+		if ba, ok := e.policy.GetAdapter().(policy.BatchAdapter); ok {
+			var lines []string
+			for _, rule := range rules {
+				lines = append(lines, "g, "+strings.Join(rule, ", "))
+			}
+			if err := ba.AddPolicies(lines); err != nil {
+				return errors.WrapError("auto-save grouping policies", err)
+			}
+		}
+	}
+
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, "g", nil, nil)
 
 	return nil
 }
@@ -656,7 +734,7 @@ func (e *Enforcer) AddGroupingPoliciesEx(rules [][]string) error {
 }
 
 // RemoveGroupingPolicy 删除角色分组策略
-// 同时更新角色继承链和从适配器删除
+// 同时更新角色继承链、从适配器删除和通知其他节点
 func (e *Enforcer) RemoveGroupingPolicy(params ...string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -666,7 +744,11 @@ func (e *Enforcer) RemoveGroupingPolicy(params ...string) error {
 	}
 
 	if len(params) >= 2 && e.autoBuildRoleLinks {
-		e.roleMgr.DeleteLink(params[0], params[1])
+		domain := make([]string, 0)
+		if len(params) >= 3 {
+			domain = append(domain, params[2])
+		}
+		e.roleMgr.DeleteLink(params[0], params[1], domain...)
 	}
 
 	if e.autoSave && e.policy.GetAdapter() != nil {
@@ -675,6 +757,8 @@ func (e *Enforcer) RemoveGroupingPolicy(params ...string) error {
 			return errors.WrapError("auto-remove grouping policy", err)
 		}
 	}
+
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", params, nil)
 
 	return nil
 }
@@ -691,19 +775,101 @@ func (e *Enforcer) RemoveGroupingPolicies(rules [][]string) error {
 	if e.autoBuildRoleLinks {
 		for _, rule := range rules {
 			if len(rule) >= 2 {
-				e.roleMgr.DeleteLink(rule[0], rule[1])
+				domain := make([]string, 0)
+				if len(rule) >= 3 {
+					domain = append(domain, rule[2])
+				}
+				e.roleMgr.DeleteLink(rule[0], rule[1], domain...)
 			}
 		}
 	}
+
+	if e.autoSave && e.policy.GetAdapter() != nil {
+		if ba, ok := e.policy.GetAdapter().(policy.BatchAdapter); ok {
+			var lines []string
+			for _, rule := range rules {
+				lines = append(lines, "g, "+strings.Join(rule, ", "))
+			}
+			if err := ba.RemovePolicies(lines); err != nil {
+				return errors.WrapError("auto-remove grouping policies", err)
+			}
+		}
+	}
+
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", nil, nil)
 
 	return nil
 }
 
 // RemoveFilteredGroupingPolicy 按字段过滤删除角色分组策略
+// 同时清理角色管理器、适配器持久化和分布式通知
 func (e *Enforcer) RemoveFilteredGroupingPolicy(fieldIndex int, fieldValues ...string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", fieldIndex, fieldValues...)
+
+	removed := e.policy.GetFilteredPolicy("g", fieldIndex, fieldValues...)
+
+	if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", fieldIndex, fieldValues...); err != nil {
+		return err
+	}
+
+	if e.autoBuildRoleLinks {
+		for _, rule := range removed {
+			if len(rule) >= 2 {
+				domain := make([]string, 0)
+				if len(rule) >= 3 {
+					domain = append(domain, rule[2])
+				}
+				e.roleMgr.DeleteLink(rule[0], rule[1], domain...)
+			}
+		}
+	}
+
+	if e.autoSave && e.policy.GetAdapter() != nil {
+		if ua, ok := e.policy.GetAdapter().(policy.UpdatableAdapter); ok {
+			if err := ua.UpdateFilteredPolicies(nil, fieldIndex, fieldValues...); err != nil {
+				return errors.WrapError("auto-remove filtered grouping policy", err)
+			}
+		} else {
+			for _, rule := range removed {
+				line := "g, " + strings.Join(rule, ", ")
+				_ = e.policy.GetAdapter().RemovePolicy(line)
+			}
+		}
+	}
+
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", nil, nil)
+
+	return nil
+}
+
+// DeleteRoleAssignments 删除指定角色的所有分配关系
+// 删除 g 段中第二列（角色列）匹配 roleName 的所有记录
+// 同时清理角色管理器、适配器持久化和分布式通知
+func (e *Enforcer) DeleteRoleAssignments(roleName string) error {
+	return e.RemoveFilteredGroupingPolicy(1, roleName)
+}
+
+// ClearAllPolicies 清理所有策略和角色关系
+// 用于租户删除等场景，彻底清空 enforcer 中的 p 段和 g 段数据
+// 同时清理角色管理器、适配器持久化和分布式通知
+func (e *Enforcer) ClearAllPolicies() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.model.ClearPolicies()
+	e.roleMgr.Clear()
+
+	if e.autoSave && e.policy.GetAdapter() != nil {
+		if err := e.policy.GetAdapter().SavePolicy(nil); err != nil {
+			return errors.WrapError("clear all policies", err)
+		}
+	}
+
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "p", nil, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", nil, nil)
+
+	return nil
 }
 
 // UpdateGroupingPolicy 更新角色分组策略
@@ -817,11 +983,28 @@ func (e *Enforcer) DeleteRoleForUser(user, roleName string, domain ...string) er
 }
 
 // DeleteRolesForUser 删除用户的所有角色
+// 同时清理 g 段策略、适配器持久化和分布式通知
 func (e *Enforcer) DeleteRolesForUser(user string, domain ...string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	roles := e.roleMgr.GetRoles(user, domain...)
+	if len(roles) == 0 {
+		return nil
+	}
+
 	for _, r := range roles {
 		e.roleMgr.DeleteLink(user, r, domain...)
 	}
+
+	if e.autoSave && e.policy.GetAdapter() != nil {
+		if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 0, user); err != nil {
+			e.logger.WarnKV("Failed to remove filtered grouping policy", "user", user, "error", err.Error())
+		}
+	}
+
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", []string{user}, nil)
+
 	return nil
 }
 
@@ -830,9 +1013,15 @@ func (e *Enforcer) DeleteUser(user string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	roles := e.roleMgr.GetRoles(user)
-	for _, r := range roles {
-		e.roleMgr.DeleteLink(user, r)
+	existingGrouping := e.policy.GetFilteredPolicy("g", 0, user)
+	for _, rule := range existingGrouping {
+		if len(rule) >= 2 {
+			domain := make([]string, 0)
+			if len(rule) >= 3 {
+				domain = append(domain, rule[2])
+			}
+			e.roleMgr.DeleteLink(rule[0], rule[1], domain...)
+		}
 	}
 
 	return e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 0, user)
@@ -843,9 +1032,15 @@ func (e *Enforcer) DeleteRole(roleName string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	users := e.roleMgr.GetUsers(roleName)
-	for _, u := range users {
-		e.roleMgr.DeleteLink(u, roleName)
+	existingGrouping := e.policy.GetFilteredPolicy("g", 1, roleName)
+	for _, rule := range existingGrouping {
+		if len(rule) >= 2 {
+			domain := make([]string, 0)
+			if len(rule) >= 3 {
+				domain = append(domain, rule[2])
+			}
+			e.roleMgr.DeleteLink(rule[0], rule[1], domain...)
+		}
 	}
 
 	return e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 1, roleName)
@@ -1008,16 +1203,44 @@ func (e *Enforcer) GetAllUsersByDomain(domain string) []string {
 }
 
 // DeleteAllUsersByDomain 删除指定域中的所有用户角色关系
+// 同时清理 g 段策略、适配器持久化和分布式通知
 func (e *Enforcer) DeleteAllUsersByDomain(domain string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	e.roleMgr.DeleteDomain(domain)
+
+	if e.autoSave && e.policy.GetAdapter() != nil {
+		if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 2, domain); err != nil {
+			e.logger.WarnKV("Failed to remove filtered grouping policy by domain", "domain", domain, "error", err.Error())
+		}
+	}
+
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", nil, nil)
+
 	return nil
 }
 
 // DeleteDomains 批量删除多个域的角色关系
+// 同时清理 g 段策略、适配器持久化和分布式通知
 func (e *Enforcer) DeleteDomains(domains ...string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	for _, d := range domains {
 		e.roleMgr.DeleteDomain(d)
 	}
+
+	if e.autoSave && e.policy.GetAdapter() != nil {
+		for _, d := range domains {
+			if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 2, d); err != nil {
+				e.logger.WarnKV("Failed to remove filtered grouping policy by domain", "domain", d, "error", err.Error())
+			}
+		}
+	}
+
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", nil, nil)
+
 	return nil
 }
 
@@ -1029,6 +1252,148 @@ func (e *Enforcer) GetAllDomains() []string {
 // GetAllRolesByDomain 获取指定域中的所有角色
 func (e *Enforcer) GetAllRolesByDomain(domain string) []string {
 	return e.roleMgr.GetRoles("role", domain)
+}
+
+// ==================== Transactional API ====================
+// 以下 API 提供事务支持，确保内存模型、角色管理器和适配器的一致性
+// 如果适配器实现了 TransactionalAdapter 接口，操作会在数据库事务中执行
+// 否则回退到非事务模式，但仍保证内存状态的一致性
+//
+// 注意：事务方法内部直接操作内存模型和角色管理器，不调用已加锁的公开方法
+// 所有事务方法自行管理锁，避免死锁
+
+// ExecuteInTransaction 在事务中执行批量操作
+// 调用方需确保 fn 内部不会尝试获取 enforcer 锁
+// 适配器支持事务时，所有操作在同一个数据库事务中执行
+func (e *Enforcer) ExecuteInTransaction(ctx context.Context, fn func() error) error {
+	if ta, ok := e.policy.GetAdapter().(policy.TransactionalAdapter); ok {
+		return ta.ExecuteInTransaction(ctx, func(_ policy.Adapter) error {
+			e.mu.Lock()
+			defer e.mu.Unlock()
+			return fn()
+		})
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return fn()
+}
+
+// TransactionalSyncUserRoles 在事务中同步用户角色
+// 先删除用户所有旧角色（含 g 段策略和适配器），再批量添加新角色
+// 适用于用户角色绑定变更场景，确保角色替换的原子性
+// groupingRules 每个元素格式为 [user, roleName, domain]
+func (e *Enforcer) TransactionalSyncUserRoles(ctx context.Context, user string, groupingRules [][]string) error {
+	return e.ExecuteInTransaction(ctx, func() error {
+		existingGrouping := e.policy.GetFilteredPolicy("g", 0, user)
+		if len(existingGrouping) > 0 {
+			for _, rule := range existingGrouping {
+				if len(rule) >= 2 {
+					domain := make([]string, 0)
+					if len(rule) >= 3 {
+						domain = append(domain, rule[2])
+					}
+					e.roleMgr.DeleteLink(rule[0], rule[1], domain...)
+				}
+			}
+			if e.autoSave && e.policy.GetAdapter() != nil {
+				if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 0, user); err != nil {
+					return err
+				}
+			}
+		}
+
+		if len(groupingRules) > 0 {
+			if err := e.policy.AddPolicies(model.SectionRoleDefinition, "g", groupingRules); err != nil {
+				return err
+			}
+
+			if e.autoBuildRoleLinks {
+				for _, rule := range groupingRules {
+					if len(rule) >= 2 {
+						domain := make([]string, 0)
+						if len(rule) >= 3 {
+							domain = append(domain, rule[2])
+						}
+						_ = e.roleMgr.AddLink(rule[0], rule[1], domain...)
+					}
+				}
+			}
+
+			if e.autoSave && e.policy.GetAdapter() != nil {
+				if ba, ok := e.policy.GetAdapter().(policy.BatchAdapter); ok {
+					var lines []string
+					for _, rule := range groupingRules {
+						lines = append(lines, "g, "+strings.Join(rule, ", "))
+					}
+					if err := ba.AddPolicies(lines); err != nil {
+						return errors.WrapError("auto-save grouping policies in transaction", err)
+					}
+				}
+			}
+		}
+
+		e.notifyPolicyChange(policy.EventTypePolicyAdded, "g", nil, nil)
+
+		return nil
+	})
+}
+
+// TransactionalDeleteUser 在事务中删除用户及其所有角色关系和权限
+// 同时清理 p 段策略、g 段策略、角色管理器和适配器
+func (e *Enforcer) TransactionalDeleteUser(ctx context.Context, user string) error {
+	return e.ExecuteInTransaction(ctx, func() error {
+		_ = e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, "p", 0, user)
+
+		existingGrouping := e.policy.GetFilteredPolicy("g", 0, user)
+		for _, rule := range existingGrouping {
+			if len(rule) >= 2 {
+				domain := make([]string, 0)
+				if len(rule) >= 3 {
+					domain = append(domain, rule[2])
+				}
+				e.roleMgr.DeleteLink(rule[0], rule[1], domain...)
+			}
+		}
+		_ = e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 0, user)
+
+		if e.autoSave && e.policy.GetAdapter() != nil {
+			if ua, ok := e.policy.GetAdapter().(policy.UpdatableAdapter); ok {
+				_ = ua.UpdateFilteredPolicies(nil, 0, user)
+			}
+		}
+
+		e.notifyPolicyChange(policy.EventTypePolicyRemoved, "p", nil, nil)
+		e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", nil, nil)
+
+		return nil
+	})
+}
+
+// TransactionalDeleteRole 在事务中删除角色及其所有关系
+// 同时清理 g 段策略、p 段策略、角色管理器和适配器
+func (e *Enforcer) TransactionalDeleteRole(ctx context.Context, roleName string) error {
+	return e.ExecuteInTransaction(ctx, func() error {
+		users := e.roleMgr.GetUsers(roleName)
+		for _, u := range users {
+			e.roleMgr.DeleteLink(u, roleName)
+		}
+
+		_ = e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 1, roleName)
+		_ = e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, "p", 0, roleName)
+
+		if e.autoSave && e.policy.GetAdapter() != nil {
+			if ua, ok := e.policy.GetAdapter().(policy.UpdatableAdapter); ok {
+				_ = ua.UpdateFilteredPolicies(nil, 1, roleName)
+				_ = ua.UpdateFilteredPolicies(nil, 0, roleName)
+			}
+		}
+
+		e.notifyPolicyChange(policy.EventTypePolicyRemoved, "p", nil, nil)
+		e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", nil, nil)
+
+		return nil
+	})
 }
 
 // ==================== Management API ====================
@@ -1552,6 +1917,20 @@ func (e *Enforcer) getPolicyAssertion() *model.Assertion {
 		}
 	}
 	return nil
+}
+
+// buildExtraPolicies 构建额外的策略段（排除指定策略）
+func (e *Enforcer) buildExtraPolicies(excludeKey string) map[string]*PolicySegment {
+	extra := make(map[string]*PolicySegment)
+	for key, assertion := range e.model.GetAssertions() {
+		if strings.HasPrefix(key, model.SectionPolicyDefinition) && key != excludeKey {
+			extra[key] = &PolicySegment{
+				Policies:  assertion.Policies,
+				Assertion: assertion,
+			}
+		}
+	}
+	return extra
 }
 
 // evaluateEffectFromResults 根据匹配策略的效果列表评估最终结果

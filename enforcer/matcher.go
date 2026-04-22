@@ -25,10 +25,19 @@ import (
 // MatchContext 匹配上下文
 // 封装一次匹配操作所需的所有数据
 type MatchContext struct {
-	Request   map[string]interface{} // 请求参数（r 段的键值对，如 r.sub="alice"）
-	Policies  [][]string             // 策略列表（p 段的所有策略行）
-	RoleMgr   *role.RoleManager      // 角色管理器（用于 g() 函数的角色继承判断）
-	Assertion *model.Assertion       // 策略断言（包含字段名映射，如 p.sub/p.obj/p.act）
+	Request       map[string]interface{}    // 请求参数（r 段的键值对，如 r.sub="alice"）
+	Policies      [][]string                // 策略列表（p 段的所有策略行）
+	RoleMgr       *role.RoleManager         // 角色管理器（用于 g() 函数的角色继承判断）
+	Assertion     *model.Assertion          // 策略断言（包含字段名映射，如 p.sub/p.obj/p.act）
+	CustomFuncs   map[string]BuiltinFunc    // 自定义函数映射（如 eval() 函数）
+	ExtraPolicies map[string]*PolicySegment // 额外策略段映射（如 extra_policies）
+}
+
+// PolicySegment 策略段
+// 封装额外的策略列表和断言，用于匹配
+type PolicySegment struct {
+	Policies  [][]string
+	Assertion *model.Assertion
 }
 
 // MatcherEngine 匹配器引擎
@@ -37,7 +46,8 @@ type MatchContext struct {
 //   - 角色匹配：RBAC 模式，通过 g(r.sub, p.sub) 判断角色继承
 //   - 表达式求值：ABAC 规则模式，通过 eval(p.sub_rule) 动态执行条件表达式
 type MatcherEngine struct {
-	logger logger.ILogger
+	logger      logger.ILogger
+	customFuncs map[string]BuiltinFunc
 }
 
 // NewMatcherEngine 创建匹配器引擎
@@ -53,9 +63,10 @@ var gFuncRegex = regexp.MustCompile(`g\(([^,]+),\s*([^,)]+)(?:,\s*([^,)]+))?\)`)
 //   - 如果有策略，遍历每条策略评估 matcher 表达式
 //   - 如果没有策略（纯 ABAC 属性匹配），直接用请求参数评估 matcher
 func (me *MatcherEngine) Match(mc *MatchContext, matcherExpr string) (bool, []string, error) {
+	me.customFuncs = mc.CustomFuncs
 	matchedEffects := make([]string, 0)
 
-	if len(mc.Policies) == 0 {
+	if len(mc.Policies) == 0 && len(mc.ExtraPolicies) == 0 {
 		vars := me.buildVariableMap(mc.Request, nil, nil)
 		expr := matcherExpr
 		if strings.Contains(expr, "eval(") {
@@ -65,6 +76,10 @@ func (me *MatcherEngine) Match(mc *MatchContext, matcherExpr string) (bool, []st
 			return true, []string{"allow"}, nil
 		}
 		return false, nil, nil
+	}
+
+	if len(mc.ExtraPolicies) > 0 {
+		return me.matchWithExtraPolicies(mc, matcherExpr, matchedEffects)
 	}
 
 	for _, p := range mc.Policies {
@@ -86,6 +101,105 @@ func (me *MatcherEngine) Match(mc *MatchContext, matcherExpr string) (bool, []st
 		return true, matchedEffects, nil
 	}
 	return false, nil, nil
+}
+
+// matchWithExtraPolicies 匹配额外策略段
+// 处理包含额外策略段的 matcher 表达式，如 p1 || p2
+func (me *MatcherEngine) matchWithExtraPolicies(mc *MatchContext, matcherExpr string, matchedEffects []string) (bool, []string, error) {
+	topOr := me.findTopLevelOp(matcherExpr, "||")
+	if topOr < 0 {
+		return me.matchSingleSegment(mc, matcherExpr, mc.Policies, mc.Assertion, matchedEffects)
+	}
+
+	leftExpr := strings.TrimSpace(matcherExpr[:topOr])
+	rightExpr := strings.TrimSpace(matcherExpr[topOr+2:])
+
+	leftHasP2 := me.exprReferencesSegment(leftExpr, "p2")
+	rightHasP2 := me.exprReferencesSegment(rightExpr, "p2")
+
+	if leftHasP2 || rightHasP2 {
+		var rbacExpr, pbacExpr string
+		var rbacPolicies [][]string
+		var rbacAssertion *model.Assertion
+		var pbacPolicies [][]string
+		var pbacAssertion *model.Assertion
+
+		if leftHasP2 {
+			rbacExpr = rightExpr
+			rbacPolicies = mc.Policies
+			rbacAssertion = mc.Assertion
+			pbacExpr = leftExpr
+		} else {
+			rbacExpr = leftExpr
+			rbacPolicies = mc.Policies
+			rbacAssertion = mc.Assertion
+			pbacExpr = rightExpr
+		}
+
+		if p2, ok := mc.ExtraPolicies["p2"]; ok {
+			pbacPolicies = p2.Policies
+			pbacAssertion = p2.Assertion
+		}
+
+		ok, effects, _ := me.matchSingleSegment(mc, rbacExpr, rbacPolicies, rbacAssertion, nil)
+		if ok {
+			matchedEffects = append(matchedEffects, effects...)
+			return true, matchedEffects, nil
+		}
+
+		ok, effects, _ = me.matchSingleSegment(mc, pbacExpr, pbacPolicies, pbacAssertion, nil)
+		if ok {
+			matchedEffects = append(matchedEffects, effects...)
+			return true, matchedEffects, nil
+		}
+
+		return false, nil, nil
+	}
+
+	return me.matchSingleSegment(mc, matcherExpr, mc.Policies, mc.Assertion, matchedEffects)
+}
+
+// matchSingleSegment 匹配单策略段
+// 处理不包含额外策略段的 matcher 表达式，如 p.sub == alice
+func (me *MatcherEngine) matchSingleSegment(mc *MatchContext, expr string, policies [][]string, assertion *model.Assertion, matchedEffects []string) (bool, []string, error) {
+	if matchedEffects == nil {
+		matchedEffects = make([]string, 0)
+	}
+
+	if len(policies) == 0 {
+		vars := me.buildVariableMap(mc.Request, nil, nil)
+		expandedExpr := expr
+		if strings.Contains(expandedExpr, "eval(") {
+			expandedExpr = me.expandEval(expandedExpr, vars)
+		}
+		if me.evalExpr(expandedExpr, vars, mc.RoleMgr) {
+			return true, []string{"allow"}, nil
+		}
+		return false, nil, nil
+	}
+
+	for _, p := range policies {
+		vars := me.buildVariableMap(mc.Request, p, assertion)
+		expandedExpr := expr
+		if strings.Contains(expandedExpr, "eval(") {
+			expandedExpr = me.expandEval(expandedExpr, vars)
+		}
+		if me.evalExpr(expandedExpr, vars, mc.RoleMgr) {
+			eft := me.extractEffect(p, assertion)
+			matchedEffects = append(matchedEffects, eft)
+		}
+	}
+
+	if len(matchedEffects) > 0 {
+		return true, matchedEffects, nil
+	}
+	return false, nil, nil
+}
+
+// exprReferencesSegment 检查表达式是否引用了额外策略段
+// 例如：p1 || p2.sub == alice
+func (me *MatcherEngine) exprReferencesSegment(expr string, segment string) bool {
+	return strings.Contains(expr, segment+".")
 }
 
 // expandEval 将 eval(p.sub_rule) 替换为策略中对应的条件表达式值
@@ -129,6 +243,31 @@ func (me *MatcherEngine) evalExpr(expr string, vars map[string]interface{}, role
 		return false
 	}
 
+	// 去除最外层配对括号，如 (r.act == p.act || p.act == "*") → r.act == p.act || p.act == "*"
+	for {
+		if !strings.HasPrefix(expr, "(") || !strings.HasSuffix(expr, ")") {
+			break
+		}
+		depth := 0
+		matched := true
+		for i, ch := range expr {
+			if ch == '(' {
+				depth++
+			} else if ch == ')' {
+				depth--
+			}
+			if depth == 0 && i < len(expr)-1 {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			expr = strings.TrimSpace(expr[1 : len(expr)-1])
+		} else {
+			break
+		}
+	}
+
 	// 处理 && （逻辑与）— 需要考虑括号嵌套
 	if topAnd := me.findTopLevelOp(expr, "&&"); topAnd >= 0 {
 		left := expr[:topAnd]
@@ -146,6 +285,24 @@ func (me *MatcherEngine) evalExpr(expr string, vars map[string]interface{}, role
 	// 处理 g() 函数调用
 	if strings.Contains(expr, "g(") {
 		return me.evalGFunction(expr, vars, roleMgr)
+	}
+
+	// 处理自定义函数调用，如 keyMatch3(r.obj, p.obj)
+	if fnName, fnArgs, ok := me.parseFunctionCall(expr); ok {
+		if fn, exists := me.customFuncs[fnName]; exists {
+			resolvedArgs := make([]interface{}, len(fnArgs))
+			for i, arg := range fnArgs {
+				resolvedArgs[i] = me.resolveValue(strings.TrimSpace(arg), vars)
+			}
+			result, err := fn(resolvedArgs...)
+			if err != nil {
+				return false
+			}
+			if b, ok := result.(bool); ok {
+				return b
+			}
+			return false
+		}
 	}
 
 	// 处理 == 比较
@@ -278,6 +435,59 @@ func (me *MatcherEngine) buildVariableMap(request map[string]interface{}, policy
 	}
 
 	return vars
+}
+
+// parseFunctionCall 解析函数调用表达式
+// 例如：keyMatch3(r.obj, p.obj) → fnName="keyMatch3", fnArgs=["r.obj", "p.obj"]
+func (me *MatcherEngine) parseFunctionCall(expr string) (string, []string, bool) {
+	expr = strings.TrimSpace(expr)
+
+	// 找到左括号位置
+	lpIdx := strings.Index(expr, "(")
+	if lpIdx < 0 {
+		return "", nil, false
+	}
+
+	// 确认右括号在末尾
+	if !strings.HasSuffix(expr, ")") {
+		return "", nil, false
+	}
+
+	fnName := strings.TrimSpace(expr[:lpIdx])
+	if fnName == "" || fnName == "g" || fnName == "eval" {
+		return "", nil, false
+	}
+
+	inner := expr[lpIdx+1 : len(expr)-1]
+
+	var args []string
+	depth := 0
+	var current strings.Builder
+
+	for _, ch := range inner {
+		if ch == '(' || ch == '[' {
+			depth++
+			current.WriteRune(ch)
+		} else if ch == ')' || ch == ']' {
+			depth--
+			current.WriteRune(ch)
+		} else if ch == ',' && depth == 0 {
+			args = append(args, strings.TrimSpace(current.String()))
+			current.Reset()
+		} else {
+			current.WriteRune(ch)
+		}
+	}
+
+	if current.Len() > 0 {
+		args = append(args, strings.TrimSpace(current.String()))
+	}
+
+	if len(args) == 0 {
+		return "", nil, false
+	}
+
+	return fnName, args, true
 }
 
 // resolveValue 解析变量值
