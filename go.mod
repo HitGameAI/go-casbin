@@ -3,8 +3,8 @@ module github.com/kamalyes/go-casbin
 go 1.25.0
 
 require (
-	github.com/kamalyes/go-logger v0.4.6-0.20260320160038-f1cdda12311b
-	github.com/kamalyes/go-toolbox v0.11.87-0.20260416011949-e35a4e01a90a
+	github.com/kamalyes/go-logger v0.4.6
+	github.com/kamalyes/go-toolbox v0.12.0
 	github.com/stretchr/testify v1.11.1
 )
 
@@ -21,3 +21,8 @@ require (
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+// 本地开发替换
+// replace github.com/kamalyes/go-toolbox => ../go-toolbox
+
+// replace github.com/kamalyes/go-logger => ../go-logger
