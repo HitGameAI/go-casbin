@@ -1847,10 +1847,12 @@ func (e *Enforcer) doEnforce(ctx context.Context, rvals ...interface{}) (bool, e
 	}
 
 	mc := &MatchContext{
-		Request:   request,
-		Policies:  policyAssertion.Policies,
-		RoleMgr:   e.roleMgr,
-		Assertion: policyAssertion,
+		Request:       request,
+		Policies:      policyAssertion.Policies,
+		RoleMgr:       e.roleMgr,
+		Assertion:     policyAssertion,
+		CustomFuncs:   e.customFuncs,
+		ExtraPolicies: e.buildExtraPolicies("p"),
 	}
 
 	matched, matchedEffects, err := e.matcher.Match(mc, matcherExpr)
@@ -1911,8 +1913,13 @@ func (e *Enforcer) getMatcherExpression() string {
 
 // getPolicyAssertion 获取 p 段的策略断言
 func (e *Enforcer) getPolicyAssertion() *model.Assertion {
+	// 精确匹配 key="p"，避免匹配到 p2、p3 等额外策略段
+	if assertion, ok := e.model.GetAssertions()["p"]; ok {
+		return assertion
+	}
+	// 回退：遍历查找第一个策略段
 	for key, assertion := range e.model.GetAssertions() {
-		if strings.HasPrefix(key, model.SectionPolicyDefinition) {
+		if key == model.SectionPolicyDefinition {
 			return assertion
 		}
 	}

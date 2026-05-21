@@ -133,11 +133,11 @@ func (pw *PolicyWatcher) checkFileChange() {
 		pw.mu.Unlock()
 
 		for _, cb := range callbacks {
-			cb := cb
 			_ = pw.workerPool.Submit(context.Background(), func() {
-				syncx.RecoverToError(nil, func(r interface{}) {
-					cb()
+				defer syncx.RecoverToError(nil, func(r interface{}) {
+					pw.logger.WarnKV("Callback panic recovered", "error", r)
 				})
+				cb()
 			})
 		}
 	}

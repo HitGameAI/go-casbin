@@ -200,7 +200,7 @@ func (rm *RoleManager) GetHierarchy() *RoleHierarchy {
 }
 
 func (rm *RoleManager) collectImplicitRoles(key string, visited map[string]bool, result *[]string, depth int) {
-	if visited[key] || depth > rm.maxDepth {
+	if visited[key] || depth >= rm.maxDepth {
 		return
 	}
 	visited[key] = true
@@ -213,7 +213,7 @@ func (rm *RoleManager) collectImplicitRoles(key string, visited map[string]bool,
 }
 
 func (rm *RoleManager) collectImplicitUsers(key string, visited map[string]bool, result *[]string, depth int) {
-	if visited[key] || depth > rm.maxDepth {
+	if visited[key] || depth >= rm.maxDepth {
 		return
 	}
 	visited[key] = true

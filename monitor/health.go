@@ -26,10 +26,10 @@ const (
 )
 
 type HealthCheckResult struct {
-	Status    HealthStatus        `json:"status"`
-	Component string             `json:"component"`
-	Message   string             `json:"message,omitempty"`
-	Timestamp time.Time           `json:"timestamp"`
+	Status    HealthStatus           `json:"status"`
+	Component string                 `json:"component"`
+	Message   string                 `json:"message,omitempty"`
+	Timestamp time.Time              `json:"timestamp"`
 	Details   map[string]interface{} `json:"details,omitempty"`
 }
 
@@ -57,13 +57,14 @@ func (hc *HealthChecker) CheckEnforcer(state string, enabled bool) HealthCheckRe
 		return result
 	}
 
-	if state == "ready" {
+	switch state {
+	case "ready":
 		result.Status = HealthStatusHealthy
 		result.Message = "enforcer is ready"
-	} else if state == "error" {
+	case "error":
 		result.Status = HealthStatusUnhealthy
 		result.Message = "enforcer is in error state"
-	} else {
+	default:
 		result.Status = HealthStatusDegraded
 		result.Message = "enforcer state: " + state
 	}

@@ -326,6 +326,168 @@ A: 使用 ABAC 规则策略模式，通过 `eval()` 动态求值：
 p, r.sub.Role == "admin" && r.obj.Owner == r.sub, data1, write
 ```
 
+## 🔄 代码中使用模型配置
+
+除了从 `.conf` 文件加载模型外，go-casbin 还支持在代码中直接通过内联字符串创建模型，这在单元测试和动态场景中非常实用。
+
+### 从字符串创建模型
+
+使用 `model.NewModelFromText()` 方法，直接传入 INI 格式的模型配置字符串：
+
+```go
+import (
+    "github.com/kamalyes/go-casbin/model"
+    "github.com/kamalyes/go-logger"
+)
+
+m, err := model.NewModelFromText(`
+[request_definition]
+r = sub, obj, act
+
+[policy_definition]
+p = sub, obj, act
+
+[role_definition]
+g = _, _
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act
+`, logger.NewLogger())
+```
+
+### 模型配置字符串格式说明
+
+模型配置字符串遵循标准 INI 格式，由 `[段名]` 标记各段，等号左侧为段标识符，右侧为参数列表：
+
+```
+[段名]
+标识符 = 参数1, 参数2, 参数3, ...
+```
+
+| 段名 | 标识符 | 含义 | 示例 |
+|------|--------|------|------|
+| `[request_definition]` | `r` | 请求参数定义 | `r = sub, obj, act` |
+| `[policy_definition]` | `p` | 策略参数定义 | `p = sub, obj, act` |
+| `[role_definition]` | `g` | 角色继承定义 | `g = _, _`（两段式）或 `g = _, _, _`（带域） |
+| `[policy_effect]` | `e` | 策略效果组合 | `e = some(where (p.eft == allow))` |
+| `[matchers]` | `m` | 匹配器表达式 | `m = r.sub == p.sub && r.obj == p.obj` |
+
+### 各段参数占位符
+
+- **`_`**（下划线）：在 `role_definition` 中表示占位符，`g = _, _` 表示两参数（用户、角色），`g = _, _, _` 表示三参数（用户、角色、域）
+- **`sub` / `obj` / `act`**：分别代表主体、客体、操作，是最常用的三段式参数
+- **`eft`**：效果字段，取值为 `allow` 或 `deny`，用于策略效果组合
+
+### 常见模型配置字符串模板
+
+#### ACL 模型
+
+```go
+m, _ := model.NewModelFromText(`
+[request_definition]
+r = sub, obj, act
+
+[policy_definition]
+p = sub, obj, act
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
+`, logger.NewLogger())
+```
+
+#### RBAC 模型
+
+```go
+m, _ := model.NewModelFromText(`
+[request_definition]
+r = sub, obj, act
+
+[policy_definition]
+p = sub, obj, act
+
+[role_definition]
+g = _, _
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = g(r.sub, p.sub) && r.obj == p.obj && r.act == p.act
+`, logger.NewLogger())
+```
+
+#### 多租户 RBAC 模型
+
+```go
+m, _ := model.NewModelFromText(`
+[request_definition]
+r = sub, dom, obj, act
+
+[policy_definition]
+p = sub, dom, obj, act
+
+[role_definition]
+g = _, _, _
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = g(r.sub, p.sub, r.dom) && r.dom == p.dom && r.obj == p.obj && r.act == p.act
+`, logger.NewLogger())
+```
+
+### 在测试中使用
+
+在单元测试中，使用 `NewModelFromText` 可以避免依赖外部 `.conf` 文件，使测试自包含且更易维护：
+
+```go
+func TestPolicy_CRUD(t *testing.T) {
+    m, err := model.NewModelFromText(`
+[request_definition]
+r = sub, obj, act
+
+[policy_definition]
+p = sub, obj, act
+
+[role_definition]
+g = _, _
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
+`, logger.NewLogger())
+    require.NoError(t, err)
+
+    p := policy.NewPolicy(m, policy.NewMemoryAdapter(), logger.NewLogger())
+
+    // 测试策略 CRUD...
+    err = p.AddPolicy("", "p", []string{"alice", "data1", "read"})
+    require.NoError(t, err)
+    assert.True(t, p.HasPolicy("p", []string{"alice", "data1", "read"}))
+}
+```
+
+### 从文件加载 vs 从字符串创建
+
+| 特性 | `NewModelFromFile` / `WithModelPath` | `NewModelFromText` |
+|------|--------------------------------------|---------------------|
+| 配置来源 | `.conf` 文件 | 内联字符串 |
+| 适用场景 | 生产环境、配置需要独立管理 | 单元测试、动态配置、原型验证 |
+| 可维护性 | 高，配置与代码分离 | 低，配置嵌入代码中 |
+| 热更新 | 支持（文件监听） | 不支持 |
+| 依赖 | 需要文件系统 | 无外部依赖 |
+
+> **提示**：生产环境推荐使用 `.conf` 文件方式，便于配置管理和热更新；测试和动态场景推荐使用 `NewModelFromText`，避免文件依赖。
+
 ## 🚀 下一步
 
 - 查看 [策略管理指南](policy-management.md) 学习如何管理策略

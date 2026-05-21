@@ -59,10 +59,10 @@ func (ee *EffectEvaluator) Evaluate(effects []string) (EffectResult, error) {
 	expr := strings.ToLower(ee.effectExpr)
 
 	switch {
-	case strings.Contains(expr, "some(where"):
-		return ee.evaluateSomeWhere(effects, expr)
 	case strings.Contains(expr, "!some(where"):
 		return ee.evaluateNotSomeWhere(effects, expr)
+	case strings.Contains(expr, "some(where"):
+		return ee.evaluateSomeWhere(effects, expr)
 	case strings.Contains(expr, "some(where (p_eft"):
 		return ee.evaluateSomeWhereP(effects, expr)
 	default:

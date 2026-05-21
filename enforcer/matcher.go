@@ -268,18 +268,19 @@ func (me *MatcherEngine) evalExpr(expr string, vars map[string]interface{}, role
 		}
 	}
 
-	// 处理 && （逻辑与）— 需要考虑括号嵌套
-	if topAnd := me.findTopLevelOp(expr, "&&"); topAnd >= 0 {
-		left := expr[:topAnd]
-		right := expr[topAnd+2:]
-		return me.evalExpr(left, vars, roleMgr) && me.evalExpr(right, vars, roleMgr)
-	}
-
-	// 处理 || （逻辑或）— 需要考虑括号嵌套
+	// 处理 || （逻辑或）— 优先级低于 &&，先拆分
+	// 必须在 && 之前处理，确保 a && b || c && d 被解析为 (a && b) || (c && d)
 	if topOr := me.findTopLevelOp(expr, "||"); topOr >= 0 {
 		left := expr[:topOr]
 		right := expr[topOr+2:]
 		return me.evalExpr(left, vars, roleMgr) || me.evalExpr(right, vars, roleMgr)
+	}
+
+	// 处理 && （逻辑与）— 优先级高于 ||
+	if topAnd := me.findTopLevelOp(expr, "&&"); topAnd >= 0 {
+		left := expr[:topAnd]
+		right := expr[topAnd+2:]
+		return me.evalExpr(left, vars, roleMgr) && me.evalExpr(right, vars, roleMgr)
 	}
 
 	// 处理 g() 函数调用
@@ -335,9 +336,10 @@ func (me *MatcherEngine) findTopLevelOp(expr string, op string) int {
 	depth := 0
 	for i := 0; i <= len(expr)-len(op); i++ {
 		ch := expr[i]
-		if ch == '(' {
+		switch ch {
+		case '(':
 			depth++
-		} else if ch == ')' {
+		case ')':
 			depth--
 		}
 		if depth == 0 && expr[i:i+len(op)] == op {
