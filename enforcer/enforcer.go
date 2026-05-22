@@ -46,6 +46,7 @@ const (
 //   - 角色管理：AddGroupingPolicy/GetRolesForUser 等角色继承操作
 //   - 多租户：GetRolesForUserInDomain/GetPermissionsForUserInDomain 等域隔离操作
 //   - 生命周期：状态机管理（Ready/Disabled/Error），熔断保护，自动重试
+//   - 公开策略：IsPublicPolicy 检查路径是否允许匿名访问
 //
 // 使用方式：
 //
@@ -73,10 +74,11 @@ type Enforcer struct {
 
 	customFuncs map[string]BuiltinFunc // 自定义匹配函数（可在 matcher 表达式中使用）
 
-	autoSave           bool // 是否自动保存策略到适配器（AddPolicy/RemovePolicy 时自动持久化）
-	autoBuildRoleLinks bool // 是否自动构建角色继承链（添加 g 策略时自动更新角色关系）
-	autoNotifyWatcher  bool // 是否自动通知策略变更（含 Pub/Sub 广播到其他节点）
-	enabled            bool // 执行器是否启用（禁用时所有 Enforce 返回 EnforcerDisabledError）
+	autoSave           bool       // 是否自动保存策略到适配器（AddPolicy/RemovePolicy 时自动持久化）
+	autoBuildRoleLinks bool       // 是否自动构建角色继承链（添加 g 策略时自动更新角色关系）
+	autoNotifyWatcher  bool       // 是否自动通知策略变更（含 Pub/Sub 广播到其他节点）
+	enabled            bool       // 执行器是否启用（禁用时所有 Enforce 返回 EnforcerDisabledError）
+	publicPolicies     [][]string // 公开接口策略（允许匿名访问的路径，不持久化到适配器）
 }
 
 // NewEnforcer 创建核心执行器
@@ -114,6 +116,7 @@ func NewEnforcer(opts ...Option) (*Enforcer, error) {
 		stateMachine:       sm,
 		idGenerator:        idgen.NewIDGenerator(string(idgen.GeneratorTypeUUID)),
 		customFuncs:        make(map[string]BuiltinFunc),
+		publicPolicies:     o.publicPolicies,
 	}
 
 	e.registerBuiltinFunctions()
@@ -179,6 +182,13 @@ func NewEnforcer(opts ...Option) (*Enforcer, error) {
 		if err := sm.TransitionTo(StateReady); err != nil {
 			o.logger.WarnKV("Failed to transition to ready state", "error", err.Error())
 		}
+	}
+
+	// 加载公开接口策略（仅内存，不持久化到适配器）
+	if len(o.publicPolicies) > 0 {
+		e.publicPolicies = o.publicPolicies
+		e.reloadPublicPoliciesUnlocked()
+		o.logger.InfoKV("Public policies loaded", "count", len(o.publicPolicies))
 	}
 
 	o.logger.InfoKV("Enforcer created successfully",
@@ -1596,6 +1606,31 @@ func (e *Enforcer) SelfUpdatePolicies(sec, ptype string, oldRules, newRules [][]
 	return e.policy.UpdatePolicies(sec, ptype, oldRules, newRules)
 }
 
+// ==================== Public Policy API ====================
+// 公开接口策略：允许匿名用户访问的路径，在启动时从代码加载，不持久化到适配器
+
+// IsPublicPolicy 检查指定路径和方法是否为公开接口
+// 通过 Enforce 检查 anonymous 主体是否有权限访问
+// 适用于 Gateway 的 Authorities 方法：公开接口无需 JWT 验证直接放行
+//
+// 参数格式取决于模型定义：
+//   - RBAC: IsPublicPolicy("/v1/login", "POST")
+//   - RBAC Domain: IsPublicPolicy("tenant::x", "/v1/login", "POST")
+func (e *Enforcer) IsPublicPolicy(rvals ...interface{}) (bool, error) {
+	// 将 anonymous 作为主体插入到请求参数的最前面
+	requestParams := append([]interface{}{"anonymous"}, rvals...)
+	return e.Enforce(requestParams...)
+}
+
+// GetPublicPolicies 获取当前配置的公开策略列表
+func (e *Enforcer) GetPublicPolicies() [][]string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	result := make([][]string, len(e.publicPolicies))
+	copy(result, e.publicPolicies)
+	return result
+}
+
 // ==================== Enforcer Control API ====================
 // 以下 API 控制执行器的行为开关和状态
 
@@ -1722,6 +1757,7 @@ func (e *Enforcer) ClearPolicy() {
 // LoadPolicy 从适配器加载策略
 // 加载失败时状态机切换到 StateError
 // 加载成功后自动构建角色继承链（如果 autoBuildRoleLinks 开启）
+// 公开策略会在适配器策略加载后自动重新注入
 func (e *Enforcer) LoadPolicy() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -1730,6 +1766,10 @@ func (e *Enforcer) LoadPolicy() error {
 		_ = e.stateMachine.TransitionTo(StateError)
 		return err
 	}
+
+	// 重新加载公开策略（仅内存，不持久化）
+	// 直接调用内部方法，因为外层已持有锁
+	e.reloadPublicPoliciesUnlocked()
 
 	if e.autoBuildRoleLinks {
 		e.loadRoleLinks()
@@ -1784,6 +1824,10 @@ func (e *Enforcer) ReloadPolicy() error {
 		return err
 	}
 
+	// 重新加载公开策略（仅内存，不持久化）
+	// 直接调用内部方法，因为外层已持有锁
+	e.reloadPublicPoliciesUnlocked()
+
 	e.loadRoleLinks()
 	e.logger.InfoKV("Policy reloaded successfully")
 	return nil
@@ -1796,6 +1840,22 @@ func (e *Enforcer) SetMonitor(m interface{}) {
 
 // ==================== Internal Methods ====================
 // 以下为内部方法，不对外暴露
+
+// reloadPublicPoliciesUnlocked 重新加载公开策略（无锁版本）
+// 调用方必须已持有 e.mu 锁
+// 临时移除适配器，防止公开策略被写入持久化存储
+func (e *Enforcer) reloadPublicPoliciesUnlocked() {
+	if len(e.publicPolicies) == 0 {
+		return
+	}
+	// 临时移除适配器，确保公开策略仅添加到模型内存，不持久化
+	prevAdapter := e.policy.GetAdapter()
+	e.policy.SetAdapter(nil)
+	if err := e.policy.AddPoliciesEx(model.SectionPolicyDefinition, "p", e.publicPolicies); err != nil {
+		e.logger.WarnKV("Failed to reload public policies", "error", err.Error())
+	}
+	e.policy.SetAdapter(prevAdapter)
+}
 
 // executeWithBreaker 通过熔断器执行函数
 // 当熔断器处于 Open 状态时直接返回 ErrBreakerOpen 错误

@@ -7,3 +7,5 @@ p, admin, data2, read
 p, admin, data2, write
 g, alice, admin
 g, bob, viewer
+p, anonymous, /v1/login, POST
+p, anonymous, /v1/register, POST

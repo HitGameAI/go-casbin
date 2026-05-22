@@ -23,18 +23,19 @@ import (
 // Options 执行器配置项
 // 所有字段均为私有，通过 WithXxx 选项函数设置，支持链式调用
 type Options struct {
-	modelPath     string                // 模型文件路径（如 resources/rbac_model.conf）
-	policyPath    string                // 策略文件路径（如 resources/rbac_policy.csv）
-	modelText     string                // 模型文本内容（与 modelPath 二选一）
-	logger        logger.ILogger        // 日志记录器（基于 go-logger）
-	breaker       *breaker.Circuit      // 熔断器（基于 go-toolbox/breaker，保护下游存储）
-	retry         *retry.Retry          // 重试器（基于 go-toolbox/retry，自动重试失败操作）
-	adapter       policy.Adapter        // 外部策略适配器（ORM/Redis 等，优先于文件适配器）
-	notifier      policy.PolicyNotifier // 分布式策略变更通知器（Redis Pub/Sub/Kafka/NATS）
-	autoSave      bool                  // 是否自动保存策略变更到适配器
-	enabled       bool                  // 执行器是否启用（禁用时所有 Enforce 返回错误）
-	watcher       bool                  // 是否启用文件变更监控（单机热更新）
-	watchInterval time.Duration         // 文件变更监控间隔
+	modelPath      string                // 模型文件路径（如 resources/rbac_model.conf）
+	policyPath     string                // 策略文件路径（如 resources/rbac_policy.csv）
+	modelText      string                // 模型文本内容（与 modelPath 二选一）
+	logger         logger.ILogger        // 日志记录器（基于 go-logger）
+	breaker        *breaker.Circuit      // 熔断器（基于 go-toolbox/breaker，保护下游存储）
+	retry          *retry.Retry          // 重试器（基于 go-toolbox/retry，自动重试失败操作）
+	adapter        policy.Adapter        // 外部策略适配器（ORM/Redis 等，优先于文件适配器）
+	notifier       policy.PolicyNotifier // 分布式策略变更通知器（Redis Pub/Sub/Kafka/NATS）
+	autoSave       bool                  // 是否自动保存策略变更到适配器
+	enabled        bool                  // 执行器是否启用（禁用时所有 Enforce 返回错误）
+	watcher        bool                  // 是否启用文件变更监控（单机热更新）
+	watchInterval  time.Duration         // 文件变更监控间隔
+	publicPolicies [][]string            // 公开接口策略（允许匿名访问的路径，不持久化到适配器）
 }
 
 // defaultOptions 返回默认配置
@@ -155,5 +156,30 @@ func WithNotifier(notifier policy.PolicyNotifier) Option {
 func WithAdapter(adapter policy.Adapter) Option {
 	return func(o *Options) {
 		o.adapter = adapter
+	}
+}
+
+// WithPublicPolicies 设置公开接口策略
+// 公开策略定义允许匿名用户（anonymous）访问的路径和方法
+// 这些策略仅在内存中维护，不会持久化到适配器
+// 每次服务启动时从代码重新加载，确保修改即时生效
+//
+// 策略格式取决于模型定义，常见格式：
+//   - RBAC: {"anonymous", "/v1/login", "POST", "allow"}
+//   - RBAC Domain: {"anonymous", "tenant::x", "/v1/login", "POST", "allow"}
+//
+// 使用示例：
+//
+//	e, _ := enforcer.NewEnforcer(
+//	    enforcer.WithModelText(rbacModel),
+//	    enforcer.WithPublicPolicies([][]string{
+//	        {"anonymous", "/v1/login", "POST", "allow"},
+//	        {"anonymous", "/v1/refresh", "POST", "allow"},
+//	    }),
+//	)
+//	ok, _ := e.IsPublicPolicy("/v1/login", "POST") // true
+func WithPublicPolicies(policies [][]string) Option {
+	return func(o *Options) {
+		o.publicPolicies = policies
 	}
 }
