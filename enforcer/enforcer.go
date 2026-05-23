@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-03-28 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-03-28 00:00:00
+ * @LastEditTime: 2026-05-23 09:16:22
  * @FilePath: \go-casbin\enforcer\enforcer.go
  * @Description: 核心执行器（含熔断、重试、状态机、完整RBAC/Management API）
  *
@@ -34,6 +34,12 @@ const (
 	StateReady    = "ready"    // 就绪状态：正常执行权限校验
 	StateDisabled = "disabled" // 禁用状态：所有 Enforce 调用返回错误
 	StateError    = "error"    // 错误状态：策略加载失败等异常
+)
+
+// 策略主体常量
+const (
+	SubjectAnonymous     = "anonymous"     // 匿名主体：公开接口策略使用
+	SubjectAuthenticated = "authenticated" // 已认证主体：认证免鉴权策略使用
 )
 
 // Enforcer 核心执行器
@@ -79,6 +85,14 @@ type Enforcer struct {
 	autoNotifyWatcher  bool       // 是否自动通知策略变更（含 Pub/Sub 广播到其他节点）
 	enabled            bool       // 执行器是否启用（禁用时所有 Enforce 返回 EnforcerDisabledError）
 	publicPolicies     [][]string // 公开接口策略（允许匿名访问的路径，不持久化到适配器）
+	authSkipPolicies   [][]string // 认证免鉴权策略（需 JWT 但跳过 Casbin 的路径，不持久化到适配器）
+
+	// 性能优化：缓存热路径上重复创建的对象
+	effectEvaluator *policy.EffectEvaluator   // 缓存效果评估器（effect 表达式在模型加载后不变）
+	extraPolicies   map[string]*PolicySegment // 缓存额外策略段（p2/p3 等，策略变更时重建）
+	matcherExpr     string                    // 缓存 matcher 表达式（模型加载后不变）
+	requestTokens   []string                  // 缓存请求 token 列表（r 段定义，模型加载后不变）
+	shortCircuit    bool                      // 缓存短路优化标志（effect 表达式不变时结果不变）
 }
 
 // NewEnforcer 创建核心执行器
@@ -117,6 +131,7 @@ func NewEnforcer(opts ...Option) (*Enforcer, error) {
 		idGenerator:        idgen.NewIDGenerator(string(idgen.GeneratorTypeUUID)),
 		customFuncs:        make(map[string]BuiltinFunc),
 		publicPolicies:     o.publicPolicies,
+		authSkipPolicies:   o.authSkipPolicies,
 	}
 
 	e.registerBuiltinFunctions()
@@ -159,6 +174,9 @@ func NewEnforcer(opts ...Option) (*Enforcer, error) {
 		e.loadRoleLinks()
 	}
 
+	// 初始化性能缓存：effect 评估器和 matcher 表达式在模型加载后不变
+	e.initCachedFields()
+
 	if o.watcher && o.policyPath != "" {
 		e.watcher = policy.NewPolicyWatcher(o.policyPath, o.watchInterval, o.logger)
 		e.watcher.AddCallback(func() {
@@ -189,6 +207,13 @@ func NewEnforcer(opts ...Option) (*Enforcer, error) {
 		e.publicPolicies = o.publicPolicies
 		e.reloadPublicPoliciesUnlocked()
 		o.logger.InfoKV("Public policies loaded", "count", len(o.publicPolicies))
+	}
+
+	// 加载认证免鉴权策略（仅内存，不持久化到适配器）
+	if len(o.authSkipPolicies) > 0 {
+		e.authSkipPolicies = o.authSkipPolicies
+		e.reloadAuthSkipPoliciesUnlocked()
+		o.logger.InfoKV("Auth-skip policies loaded", "count", len(o.authSkipPolicies))
 	}
 
 	o.logger.InfoKV("Enforcer created successfully",
@@ -288,10 +313,15 @@ func (e *Enforcer) EnforceExWithMatcher(matcherExpr string, rvals ...interface{}
 }
 
 // BatchEnforce 批量执行权限校验
+// 共享一次读锁，避免每个请求重复获取/释放 RLock
 func (e *Enforcer) BatchEnforce(requests [][]interface{}) ([]bool, error) {
 	results := make([]bool, len(requests))
+
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
 	for i, req := range requests {
-		result, err := e.Enforce(req...)
+		result, err := e.doEnforce(context.Background(), req...)
 		if err != nil {
 			return nil, err
 		}
@@ -301,10 +331,15 @@ func (e *Enforcer) BatchEnforce(requests [][]interface{}) ([]bool, error) {
 }
 
 // BatchEnforceWithMatcher 使用自定义匹配表达式批量执行权限校验
+// 共享一次读锁，避免每个请求重复获取/释放 RLock
 func (e *Enforcer) BatchEnforceWithMatcher(matcherExpr string, requests [][]interface{}) ([]bool, error) {
 	results := make([]bool, len(requests))
+
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
 	for i, req := range requests {
-		result, err := e.EnforceWithMatcher(matcherExpr, req...)
+		result, err := e.doEnforceWithMatcher(context.Background(), matcherExpr, req...)
 		if err != nil {
 			return nil, err
 		}
@@ -321,6 +356,16 @@ func (e *Enforcer) enforceWithMatcherExpr(matcherExpr string, rvals ...interface
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
+	return e.doEnforceWithMatcher(context.Background(), matcherExpr, rvals...)
+}
+
+// doEnforceWithMatcher 不加锁的 EnforceWithMatcher 内部实现
+// 调用方必须已持有 e.mu 读锁
+func (e *Enforcer) doEnforceWithMatcher(ctx context.Context, matcherExpr string, rvals ...interface{}) (bool, error) {
+	if err := e.validateRequest(rvals); err != nil {
+		return false, err
+	}
+
 	request := e.buildRequest(rvals...)
 	if request == nil {
 		return false, errors.NewModelInvalidError("invalid request parameters")
@@ -328,7 +373,7 @@ func (e *Enforcer) enforceWithMatcherExpr(matcherExpr string, rvals ...interface
 
 	expr := matcherExpr
 	if expr == "" {
-		expr = e.getMatcherExpression()
+		expr = e.matcherExpr
 	}
 	if expr == "" {
 		return false, errors.NewModelInvalidError("matcher expression is empty")
@@ -345,7 +390,8 @@ func (e *Enforcer) enforceWithMatcherExpr(matcherExpr string, rvals ...interface
 		RoleMgr:       e.roleMgr,
 		Assertion:     policyAssertion,
 		CustomFuncs:   e.customFuncs,
-		ExtraPolicies: e.buildExtraPolicies("p"),
+		ExtraPolicies: e.getExtraPolicies(),
+		ShortCircuit:  e.shortCircuit,
 	}
 
 	matched, matchedEffects, err := e.matcher.Match(mc, expr)
@@ -357,7 +403,7 @@ func (e *Enforcer) enforceWithMatcherExpr(matcherExpr string, rvals ...interface
 		return false, nil
 	}
 
-	effectResult, err := e.evaluateEffectFromResults(matchedEffects)
+	effectResult, err := e.evaluateEffectFromResultsCached(matchedEffects)
 	if err != nil {
 		return false, err
 	}
@@ -373,6 +419,10 @@ func (e *Enforcer) enforceExWithMatcherExpr(matcherExpr string, rvals ...interfa
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
+	if err := e.validateRequest(rvals); err != nil {
+		return false, nil, err
+	}
+
 	request := e.buildRequest(rvals...)
 	if request == nil {
 		return false, nil, errors.NewModelInvalidError("invalid request parameters")
@@ -380,7 +430,7 @@ func (e *Enforcer) enforceExWithMatcherExpr(matcherExpr string, rvals ...interfa
 
 	expr := matcherExpr
 	if expr == "" {
-		expr = e.getMatcherExpression()
+		expr = e.matcherExpr
 	}
 	if expr == "" {
 		return false, nil, errors.NewModelInvalidError("matcher expression is empty")
@@ -397,7 +447,8 @@ func (e *Enforcer) enforceExWithMatcherExpr(matcherExpr string, rvals ...interfa
 		RoleMgr:       e.roleMgr,
 		Assertion:     policyAssertion,
 		CustomFuncs:   e.customFuncs,
-		ExtraPolicies: e.buildExtraPolicies("p"),
+		ExtraPolicies: e.getExtraPolicies(),
+		ShortCircuit:  e.shortCircuit,
 	}
 
 	matched, matchedEffects, err := e.matcher.Match(mc, expr)
@@ -460,17 +511,16 @@ func (e *Enforcer) AddPolicy(params ...string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	if err := e.validatePolicyRule(model.SectionPolicyDefinition, "p", params); err != nil {
+		return err
+	}
+
+	// Policy 层已统一处理内存写入和适配器持久化（含回滚），无需 Enforcer 层重复写入
 	if err := e.policy.AddPolicy(model.SectionPolicyDefinition, "p", params); err != nil {
 		return err
 	}
 
-	if e.autoSave && e.policy.GetAdapter() != nil {
-		line := "p, " + strings.Join(params, ", ")
-		if err := e.policy.GetAdapter().AddPolicy(line); err != nil {
-			return errors.WrapError("auto-save policy", err)
-		}
-	}
-
+	e.invalidateExtraPoliciesCache()
 	e.notifyPolicyChange(policy.EventTypePolicyAdded, "p", nil, params)
 
 	return nil
@@ -481,22 +531,18 @@ func (e *Enforcer) AddPolicies(rules [][]string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	for _, rule := range rules {
+		if err := e.validatePolicyRule(model.SectionPolicyDefinition, "p", rule); err != nil {
+			return err
+		}
+	}
+
+	// Policy 层已统一处理内存写入和适配器持久化（含回滚），无需 Enforcer 层重复写入
 	if err := e.policy.AddPolicies(model.SectionPolicyDefinition, "p", rules); err != nil {
 		return err
 	}
 
-	if e.autoSave && e.policy.GetAdapter() != nil {
-		if ba, ok := e.policy.GetAdapter().(policy.BatchAdapter); ok {
-			var lines []string
-			for _, rule := range rules {
-				lines = append(lines, "p, "+strings.Join(rule, ", "))
-			}
-			if err := ba.AddPolicies(lines); err != nil {
-				return errors.WrapError("auto-save policies", err)
-			}
-		}
-	}
-
+	e.invalidateExtraPoliciesCache()
 	e.notifyPolicyChange(policy.EventTypePolicyAdded, "p", nil, nil)
 
 	return nil
@@ -514,15 +560,9 @@ func (e *Enforcer) AddNamedPolicy(ptype string, params ...string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// Policy 层已统一处理内存写入和适配器持久化（含回滚），无需 Enforcer 层重复写入
 	if err := e.policy.AddPolicy(model.SectionPolicyDefinition, ptype, params); err != nil {
 		return err
-	}
-
-	if e.autoSave && e.policy.GetAdapter() != nil {
-		line := ptype + ", " + strings.Join(params, ", ")
-		if err := e.policy.GetAdapter().AddPolicy(line); err != nil {
-			return errors.WrapError("auto-save named policy", err)
-		}
 	}
 
 	e.notifyPolicyChange(policy.EventTypePolicyAdded, ptype, nil, params)
@@ -548,17 +588,12 @@ func (e *Enforcer) RemovePolicy(params ...string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// Policy 层已统一处理内存删除和适配器持久化（含回滚），无需 Enforcer 层重复写入
 	if err := e.policy.RemovePolicy(model.SectionPolicyDefinition, "p", params); err != nil {
 		return err
 	}
 
-	if e.autoSave && e.policy.GetAdapter() != nil {
-		line := "p, " + strings.Join(params, ", ")
-		if err := e.policy.GetAdapter().RemovePolicy(line); err != nil {
-			return errors.WrapError("auto-remove policy", err)
-		}
-	}
-
+	e.invalidateExtraPoliciesCache()
 	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "p", params, nil)
 
 	return nil
@@ -569,22 +604,12 @@ func (e *Enforcer) RemovePolicies(rules [][]string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// Policy 层已统一处理内存删除和适配器持久化（含回滚），无需 Enforcer 层重复写入
 	if err := e.policy.RemovePolicies(model.SectionPolicyDefinition, "p", rules); err != nil {
 		return err
 	}
 
-	if e.autoSave && e.policy.GetAdapter() != nil {
-		if ba, ok := e.policy.GetAdapter().(policy.BatchAdapter); ok {
-			var lines []string
-			for _, rule := range rules {
-				lines = append(lines, "p, "+strings.Join(rule, ", "))
-			}
-			if err := ba.RemovePolicies(lines); err != nil {
-				return errors.WrapError("auto-remove policies", err)
-			}
-		}
-	}
-
+	e.invalidateExtraPoliciesCache()
 	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "p", nil, nil)
 
 	return nil
@@ -595,6 +620,7 @@ func (e *Enforcer) RemovePolicies(rules [][]string) error {
 func (e *Enforcer) RemoveFilteredPolicy(fieldIndex int, fieldValues ...string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.invalidateExtraPoliciesCache()
 	return e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, "p", fieldIndex, fieldValues...)
 }
 
@@ -603,15 +629,9 @@ func (e *Enforcer) RemoveNamedPolicy(ptype string, params ...string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	// Policy 层已统一处理内存删除和适配器持久化（含回滚），无需 Enforcer 层重复写入
 	if err := e.policy.RemovePolicy(model.SectionPolicyDefinition, ptype, params); err != nil {
 		return err
-	}
-
-	if e.autoSave && e.policy.GetAdapter() != nil {
-		line := ptype + ", " + strings.Join(params, ", ")
-		if err := e.policy.GetAdapter().RemovePolicy(line); err != nil {
-			return errors.WrapError("auto-save remove named policy", err)
-		}
 	}
 
 	e.notifyPolicyChange(policy.EventTypePolicyRemoved, ptype, params, nil)
@@ -636,6 +656,7 @@ func (e *Enforcer) RemoveFilteredNamedPolicy(ptype string, fieldIndex int, field
 func (e *Enforcer) UpdatePolicy(oldPolicy, newPolicy []string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.invalidateExtraPoliciesCache()
 	return e.policy.UpdatePolicy(model.SectionPolicyDefinition, "p", oldPolicy, newPolicy)
 }
 
@@ -643,6 +664,7 @@ func (e *Enforcer) UpdatePolicy(oldPolicy, newPolicy []string) error {
 func (e *Enforcer) UpdatePolicies(oldPolicies, newPolicies [][]string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.invalidateExtraPoliciesCache()
 	return e.policy.UpdatePolicies(model.SectionPolicyDefinition, "p", oldPolicies, newPolicies)
 }
 
@@ -650,6 +672,14 @@ func (e *Enforcer) UpdatePolicies(oldPolicies, newPolicies [][]string) error {
 func (e *Enforcer) UpdateFilteredPolicies(newPolicies [][]string, fieldIndex int, fieldValues ...string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+
+	for _, rule := range newPolicies {
+		if err := e.validatePolicyRule(model.SectionPolicyDefinition, "p", rule); err != nil {
+			return err
+		}
+	}
+
+	e.invalidateExtraPoliciesCache()
 
 	if e.policy.GetAdapter() != nil {
 		if ua, ok := e.policy.GetAdapter().(policy.UpdatableAdapter); ok {
@@ -1554,6 +1584,10 @@ func (e *Enforcer) HasNamedGroupingPolicy(ptype string, params ...string) bool {
 func (e *Enforcer) SelfAddPolicy(sec, ptype string, rule []string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if err := e.validatePolicyRule(sec, ptype, rule); err != nil {
+		return err
+	}
+	e.invalidateExtraPoliciesCache()
 	return e.policy.AddPolicy(sec, ptype, rule)
 }
 
@@ -1561,6 +1595,12 @@ func (e *Enforcer) SelfAddPolicy(sec, ptype string, rule []string) error {
 func (e *Enforcer) SelfAddPolicies(sec, ptype string, rules [][]string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	for _, rule := range rules {
+		if err := e.validatePolicyRule(sec, ptype, rule); err != nil {
+			return err
+		}
+	}
+	e.invalidateExtraPoliciesCache()
 	return e.policy.AddPolicies(sec, ptype, rules)
 }
 
@@ -1568,6 +1608,12 @@ func (e *Enforcer) SelfAddPolicies(sec, ptype string, rules [][]string) error {
 func (e *Enforcer) SelfAddPoliciesEx(sec, ptype string, rules [][]string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	for _, rule := range rules {
+		if err := e.validatePolicyRule(sec, ptype, rule); err != nil {
+			return err
+		}
+	}
+	e.invalidateExtraPoliciesCache()
 	return e.policy.AddPoliciesEx(sec, ptype, rules)
 }
 
@@ -1575,6 +1621,7 @@ func (e *Enforcer) SelfAddPoliciesEx(sec, ptype string, rules [][]string) error 
 func (e *Enforcer) SelfRemovePolicy(sec, ptype string, rule []string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.invalidateExtraPoliciesCache()
 	return e.policy.RemovePolicy(sec, ptype, rule)
 }
 
@@ -1582,6 +1629,7 @@ func (e *Enforcer) SelfRemovePolicy(sec, ptype string, rule []string) error {
 func (e *Enforcer) SelfRemovePolicies(sec, ptype string, rules [][]string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.invalidateExtraPoliciesCache()
 	return e.policy.RemovePolicies(sec, ptype, rules)
 }
 
@@ -1589,6 +1637,7 @@ func (e *Enforcer) SelfRemovePolicies(sec, ptype string, rules [][]string) error
 func (e *Enforcer) SelfRemoveFilteredPolicy(sec, ptype string, fieldIndex int, fieldValues ...string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.invalidateExtraPoliciesCache()
 	return e.policy.RemoveFilteredPolicy(sec, ptype, fieldIndex, fieldValues...)
 }
 
@@ -1596,6 +1645,7 @@ func (e *Enforcer) SelfRemoveFilteredPolicy(sec, ptype string, fieldIndex int, f
 func (e *Enforcer) SelfUpdatePolicy(sec, ptype string, oldRule, newRule []string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.invalidateExtraPoliciesCache()
 	return e.policy.UpdatePolicy(sec, ptype, oldRule, newRule)
 }
 
@@ -1603,6 +1653,7 @@ func (e *Enforcer) SelfUpdatePolicy(sec, ptype string, oldRule, newRule []string
 func (e *Enforcer) SelfUpdatePolicies(sec, ptype string, oldRules, newRules [][]string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.invalidateExtraPoliciesCache()
 	return e.policy.UpdatePolicies(sec, ptype, oldRules, newRules)
 }
 
@@ -1618,7 +1669,7 @@ func (e *Enforcer) SelfUpdatePolicies(sec, ptype string, oldRules, newRules [][]
 //   - RBAC Domain: IsPublicPolicy("tenant::x", "/v1/login", "POST")
 func (e *Enforcer) IsPublicPolicy(rvals ...interface{}) (bool, error) {
 	// 将 anonymous 作为主体插入到请求参数的最前面
-	requestParams := append([]interface{}{"anonymous"}, rvals...)
+	requestParams := append([]interface{}{SubjectAnonymous}, rvals...)
 	return e.Enforce(requestParams...)
 }
 
@@ -1628,6 +1679,28 @@ func (e *Enforcer) GetPublicPolicies() [][]string {
 	defer e.mu.RUnlock()
 	result := make([][]string, len(e.publicPolicies))
 	copy(result, e.publicPolicies)
+	return result
+}
+
+// IsAuthSkipPolicy 检查指定路径和方法是否为认证免鉴权接口
+// 通过 Enforce 检查 authenticated 主体是否有权限访问
+// 适用于 Gateway 的 Authorities 方法：认证免鉴权接口需要 JWT 验证但跳过 Casbin 权限校验
+//
+// 参数格式取决于模型定义：
+//   - RBAC: IsAuthSkipPolicy("/v1/auth/user-info", "GET")
+//   - RBAC Domain: IsAuthSkipPolicy("tenant::x", "/v1/auth/user-info", "GET")
+func (e *Enforcer) IsAuthSkipPolicy(rvals ...interface{}) (bool, error) {
+	// 将 authenticated 作为主体插入到请求参数的最前面
+	requestParams := append([]interface{}{SubjectAuthenticated}, rvals...)
+	return e.Enforce(requestParams...)
+}
+
+// GetAuthSkipPolicies 获取当前配置的认证免鉴权策略列表
+func (e *Enforcer) GetAuthSkipPolicies() [][]string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	result := make([][]string, len(e.authSkipPolicies))
+	copy(result, e.authSkipPolicies)
 	return result
 }
 
@@ -1653,6 +1726,8 @@ func (e *Enforcer) EnableAutoSave(autoSave bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.autoSave = autoSave
+	// 同步 Policy 层的 autoSave，确保策略操作时正确控制适配器持久化
+	e.policy.SetAutoSave(autoSave)
 }
 
 // EnableAutoBuildRoleLinks 启用/禁用自动构建角色继承链
@@ -1771,6 +1846,9 @@ func (e *Enforcer) LoadPolicy() error {
 	// 直接调用内部方法，因为外层已持有锁
 	e.reloadPublicPoliciesUnlocked()
 
+	// 重新加载认证免鉴权策略（仅内存，不持久化）
+	e.reloadAuthSkipPoliciesUnlocked()
+
 	if e.autoBuildRoleLinks {
 		e.loadRoleLinks()
 	}
@@ -1828,7 +1906,14 @@ func (e *Enforcer) ReloadPolicy() error {
 	// 直接调用内部方法，因为外层已持有锁
 	e.reloadPublicPoliciesUnlocked()
 
+	// 重新加载认证免鉴权策略（仅内存，不持久化）
+	e.reloadAuthSkipPoliciesUnlocked()
+
 	e.loadRoleLinks()
+
+	// 策略重载后重建缓存
+	e.initCachedFields()
+
 	e.logger.InfoKV("Policy reloaded successfully")
 	return nil
 }
@@ -1857,6 +1942,22 @@ func (e *Enforcer) reloadPublicPoliciesUnlocked() {
 	e.policy.SetAdapter(prevAdapter)
 }
 
+// reloadAuthSkipPoliciesUnlocked 重新加载认证免鉴权策略（无锁版本）
+// 调用方必须已持有 e.mu 锁
+// 临时移除适配器，防止认证免鉴权策略被写入持久化存储
+func (e *Enforcer) reloadAuthSkipPoliciesUnlocked() {
+	if len(e.authSkipPolicies) == 0 {
+		return
+	}
+	// 临时移除适配器，确保认证免鉴权策略仅添加到模型内存，不持久化
+	prevAdapter := e.policy.GetAdapter()
+	e.policy.SetAdapter(nil)
+	if err := e.policy.AddPoliciesEx(model.SectionPolicyDefinition, "p", e.authSkipPolicies); err != nil {
+		e.logger.WarnKV("Failed to reload auth-skip policies", "error", err.Error())
+	}
+	e.policy.SetAdapter(prevAdapter)
+}
+
 // executeWithBreaker 通过熔断器执行函数
 // 当熔断器处于 Open 状态时直接返回 ErrBreakerOpen 错误
 // 当函数执行失败时，熔断器会累计失败次数，达到阈值后熔断
@@ -1880,7 +1981,7 @@ func (e *Enforcer) executeWithBreaker(fn func() (bool, error)) (bool, error) {
 }
 
 // doEnforce 执行权限校验核心逻辑
-// 流程：构建请求 → 获取 matcher 表达式 → 匹配策略 → 评估策略效果
+// 流程：校验请求参数 → 构建请求 → 获取 matcher 表达式 → 匹配策略 → 评估策略效果
 // 内置 panic 恢复机制，防止匹配函数异常导致服务崩溃
 func (e *Enforcer) doEnforce(ctx context.Context, rvals ...interface{}) (bool, error) {
 	e.mu.RLock()
@@ -1891,12 +1992,18 @@ func (e *Enforcer) doEnforce(ctx context.Context, rvals ...interface{}) (bool, e
 		e.logger.ErrorKV("Panic recovered in enforce", "panic", fmt.Sprintf("%v", r))
 	})
 
+	// 安全校验：请求参数不能为空，且必须与模型 r 段定义的字段数量匹配
+	if err := e.validateRequest(rvals); err != nil {
+		return false, err
+	}
+
 	request := e.buildRequest(rvals...)
 	if request == nil {
 		return false, errors.NewModelInvalidError("invalid request parameters")
 	}
 
-	matcherExpr := e.getMatcherExpression()
+	// 使用缓存的 matcher 表达式，避免每次遍历 model assertions
+	matcherExpr := e.matcherExpr
 	if matcherExpr == "" {
 		return false, errors.NewModelInvalidError("matcher expression is empty")
 	}
@@ -1912,7 +2019,8 @@ func (e *Enforcer) doEnforce(ctx context.Context, rvals ...interface{}) (bool, e
 		RoleMgr:       e.roleMgr,
 		Assertion:     policyAssertion,
 		CustomFuncs:   e.customFuncs,
-		ExtraPolicies: e.buildExtraPolicies("p"),
+		ExtraPolicies: e.getExtraPolicies(), // 使用缓存的 extraPolicies
+		ShortCircuit:  e.shortCircuit,       // 短路优化：some(where(p.eft==allow)) 模式下匹配到即返回
 	}
 
 	matched, matchedEffects, err := e.matcher.Match(mc, matcherExpr)
@@ -1924,7 +2032,8 @@ func (e *Enforcer) doEnforce(ctx context.Context, rvals ...interface{}) (bool, e
 		return false, nil
 	}
 
-	effectResult, err := e.evaluateEffectFromResults(matchedEffects)
+	// 使用缓存的 effect 评估器，避免每次创建新对象
+	effectResult, err := e.evaluateEffectFromResultsCached(matchedEffects)
 	if err != nil {
 		return false, err
 	}
@@ -1932,10 +2041,146 @@ func (e *Enforcer) doEnforce(ctx context.Context, rvals ...interface{}) (bool, e
 	return bool(effectResult), nil
 }
 
+// initCachedFields 初始化性能缓存字段
+// effect 评估器和 matcher 表达式在模型加载后不会变化，缓存后避免每次 Enforce 重复创建
+// extraPolicies 在策略变更时需要重建，通过 invalidateExtraPoliciesCache 标记
+func (e *Enforcer) initCachedFields() {
+	// 缓存 matcher 表达式
+	e.matcherExpr = e.getMatcherExpression()
+
+	// 缓存 request tokens（r 段定义）
+	e.requestTokens = e.getRequestTokens()
+
+	// 缓存 effect 评估器
+	effectExpr := ""
+	for key, assertion := range e.model.GetAssertions() {
+		if strings.HasPrefix(key, model.SectionPolicyEffect) {
+			effectExpr = assertion.Value
+			break
+		}
+	}
+	if effectExpr != "" {
+		e.effectEvaluator = policy.NewEffectEvaluator(effectExpr)
+	}
+
+	// 缓存短路优化标志
+	e.shortCircuit = e.computeShortCircuit()
+
+	// 初始化 extraPolicies 缓存
+	e.extraPolicies = e.buildExtraPolicies("p")
+}
+
+// invalidateExtraPoliciesCache 使 extraPolicies 缓存失效
+// 在策略增删改时调用，下次 Enforce 时会重建
+func (e *Enforcer) invalidateExtraPoliciesCache() {
+	e.extraPolicies = nil
+}
+
+// getExtraPolicies 获取 extraPolicies（带懒加载缓存）
+func (e *Enforcer) getExtraPolicies() map[string]*PolicySegment {
+	if e.extraPolicies == nil {
+		e.extraPolicies = e.buildExtraPolicies("p")
+	}
+	return e.extraPolicies
+}
+
+// validateRequest 校验 Enforce 请求参数
+// 使用缓存的 requestTokens 避免每次遍历 model assertions
+func (e *Enforcer) validateRequest(rvals []interface{}) error {
+	if len(rvals) == 0 {
+		return errors.NewEnforcerInvalidRequestError("no parameters provided")
+	}
+
+	// 使用缓存的 requestTokens，避免每次遍历 model
+	if tokens := e.requestTokens; tokens != nil && len(rvals) != len(tokens) {
+		return errors.NewEnforcerInvalidRequestError(
+			fmt.Sprintf("expected %d parameters, got %d", len(tokens), len(rvals)))
+	}
+
+	// 校验字符串参数不能为空（空 sub/obj/act 会导致误判）
+	for i, val := range rvals {
+		if s, ok := val.(string); ok && s == "" {
+			return errors.NewEnforcerInvalidRequestError(
+				fmt.Sprintf("parameter at index %d is empty string", i))
+		}
+	}
+
+	return nil
+}
+
+// computeShortCircuit 计算是否允许短路优化
+// 当 effect 表达式为 some(where(p.eft==allow)) 模式时，匹配到 allow 即可返回
+func (e *Enforcer) computeShortCircuit() bool {
+	if e.effectEvaluator == nil {
+		return false
+	}
+	expr := strings.ToLower(strings.TrimSpace(e.effectEvaluator.GetExpression()))
+	return strings.Contains(expr, "some(where") && strings.Contains(expr, "allow") &&
+		!strings.Contains(expr, "!some") && !strings.Contains(expr, "deny")
+}
+
+// validatePolicyRule 校验策略规则
+// 检查：规则字段数量必须与模型 p 段定义匹配、字段值不能为空
+// 防止无效策略规则导致匹配异常
+func (e *Enforcer) validatePolicyRule(sec, ptype string, rule []string) error {
+	if len(rule) == 0 {
+		return errors.NewPolicyRuleInvalidError("empty policy rule")
+	}
+
+	// 获取 p 段定义的 token 数量
+	policyAssertion := e.model.GetAssertion(sec)
+	if policyAssertion == nil {
+		for key, a := range e.model.GetAssertions() {
+			if strings.HasPrefix(key, sec) {
+				policyAssertion = a
+				break
+			}
+		}
+	}
+
+	if policyAssertion != nil {
+		expectedLen := len(policyAssertion.Tokens)
+		if ptype != "p" && ptype != "" {
+			// 对于 g 段等其他策略段，不强制校验字段数量
+			expectedLen = -1
+		}
+		if expectedLen > 0 && len(rule) != expectedLen {
+			return errors.NewPolicyRuleInvalidError(
+				fmt.Sprintf("expected %d fields for %s, got %d", expectedLen, ptype, len(rule)))
+		}
+	}
+
+	// 校验字段值不能为空
+	for i, field := range rule {
+		if field == "" {
+			return errors.NewPolicyRuleInvalidError(
+				fmt.Sprintf("field at index %d is empty", i))
+		}
+	}
+
+	return nil
+}
+
 // buildRequest 根据请求参数构建请求映射
-// 将 rvals 按顺序映射到 r 段的 token 名称
-// 例如：r = sub, obj, act → rvals=["alice","data1","read"] → {r.sub:"alice", r.obj:"data1", r.act:"read"}
+// 使用缓存的 requestTokens 避免每次遍历 model assertions
 func (e *Enforcer) buildRequest(rvals ...interface{}) map[string]interface{} {
+	tokens := e.requestTokens
+	if tokens == nil {
+		return nil
+	}
+
+	request := make(map[string]interface{}, len(tokens))
+	for i, token := range tokens {
+		if i < len(rvals) {
+			request[token] = rvals[i]
+		}
+	}
+
+	return request
+}
+
+// getRequestTokens 获取 r 段的 token 列表
+func (e *Enforcer) getRequestTokens() []string {
 	reqAssertion := e.model.GetAssertion(model.SectionRequestDefinition)
 	if reqAssertion == nil {
 		for key, a := range e.model.GetAssertions() {
@@ -1945,19 +2190,10 @@ func (e *Enforcer) buildRequest(rvals ...interface{}) map[string]interface{} {
 			}
 		}
 	}
-
 	if reqAssertion == nil {
 		return nil
 	}
-
-	request := make(map[string]interface{})
-	for i, token := range reqAssertion.Tokens {
-		if i < len(rvals) {
-			request[token] = rvals[i]
-		}
-	}
-
-	return request
+	return reqAssertion.Tokens
 }
 
 // getMatcherExpression 获取 m 段的匹配器表达式
@@ -2018,6 +2254,16 @@ func (e *Enforcer) evaluateEffectFromResults(matchedEffects []string) (policy.Ef
 
 	evaluator := policy.NewEffectEvaluator(effectExpr)
 	return evaluator.Evaluate(matchedEffects)
+}
+
+// evaluateEffectFromResultsCached 使用缓存的 EffectEvaluator 评估策略效果
+// 避免每次 Enforce 都遍历 model assertions 和创建新的 EffectEvaluator
+func (e *Enforcer) evaluateEffectFromResultsCached(matchedEffects []string) (policy.EffectResult, error) {
+	if e.effectEvaluator == nil {
+		// 降级到原始方法（理论上不会发生，因为 initCachedFields 会初始化）
+		return e.evaluateEffectFromResults(matchedEffects)
+	}
+	return e.effectEvaluator.Evaluate(matchedEffects)
 }
 
 // evaluateEffect 评估策略效果（基于全部策略，兼容旧接口）

@@ -13,10 +13,10 @@ package role
 
 import (
 	"strings"
+	"sync"
 
 	"github.com/kamalyes/go-casbin/errors"
 	"github.com/kamalyes/go-logger"
-	"github.com/kamalyes/go-toolbox/pkg/syncx"
 )
 
 // RoleManager 角色管理器
@@ -36,10 +36,11 @@ import (
 //	ok := rm.HasLink("alice", "viewer")             // 检查 alice 是否继承 viewer
 //	roles := rm.GetImplicitRoles("alice")           // 获取 alice 的所有间接角色
 type RoleManager struct {
-	hierarchy *RoleHierarchy          // 角色层级管理器（继承关系图）
-	cache     syncx.Map[string, bool] // 缓存层（key="name1->name2" 或 "domain:name1->name2"）
-	logger    logger.ILogger          // 日志记录器
-	maxDepth  int                     // 递归查询最大深度（默认 10，防止无限递归）
+	hierarchy *RoleHierarchy // 角色层级管理器（继承关系图）
+	cache     sync.Map       // 缓存层（key="name1->name2" 或 "domain:name1->name2"，value=bool）
+	nameIndex sync.Map       // name→cacheKeys 索引（value=map[string]struct{}），用于精准失效
+	logger    logger.ILogger // 日志记录器
+	maxDepth  int            // 递归查询最大深度（默认 10，防止无限递归）
 }
 
 // NewRoleManager 创建角色管理器
@@ -86,7 +87,7 @@ func (rm *RoleManager) DeleteLink(name1, name2 string, domain ...string) {
 func (rm *RoleManager) HasLink(name1, name2 string, domain ...string) bool {
 	cacheKey := rm.buildCacheKey(name1, name2, domain...)
 	if result, ok := rm.cache.Load(cacheKey); ok {
-		return result
+		return result.(bool)
 	}
 
 	n1 := rm.buildKey(name1, domain)
@@ -94,6 +95,9 @@ func (rm *RoleManager) HasLink(name1, name2 string, domain ...string) bool {
 
 	result := rm.hierarchy.HasLink(n1, n2)
 	rm.cache.Store(cacheKey, result)
+	// 维护 nameIndex：将 cacheKey 关联到 name1 和 name2，用于精准失效
+	rm.addNameIndex(name1, cacheKey, domain...)
+	rm.addNameIndex(name2, cacheKey, domain...)
 	return result
 }
 
@@ -166,9 +170,15 @@ func (rm *RoleManager) GetAllDomains() []string {
 // 同时清理该域相关的所有缓存条目
 func (rm *RoleManager) DeleteDomain(domain string) {
 	rm.hierarchy.DeleteDomain(domain)
-	rm.cache.Range(func(key string, value bool) bool {
-		if strings.Contains(key, domain+":") {
+	rm.cache.Range(func(key, _ interface{}) bool {
+		if strings.Contains(key.(string), domain+":") {
 			rm.cache.Delete(key)
+		}
+		return true
+	})
+	rm.nameIndex.Range(func(key, _ interface{}) bool {
+		if strings.Contains(key.(string), domain+":") {
+			rm.nameIndex.Delete(key)
 		}
 		return true
 	})
@@ -179,10 +189,8 @@ func (rm *RoleManager) DeleteDomain(domain string) {
 // 通常在重新加载策略时调用
 func (rm *RoleManager) Clear() {
 	rm.hierarchy.Clear()
-	rm.cache.Range(func(key string, value bool) bool {
-		rm.cache.Delete(key)
-		return true
-	})
+	rm.cache = sync.Map{}
+	rm.nameIndex = sync.Map{}
 	rm.logger.DebugMsg("Role manager cleared")
 }
 
@@ -247,10 +255,34 @@ func (rm *RoleManager) stripDomain(key string, domain ...string) string {
 	return key
 }
 
+// addNameIndex 将 cacheKey 关联到指定 name，用于精准缓存失效
+func (rm *RoleManager) addNameIndex(name, cacheKey string, domain ...string) {
+	indexKey := rm.buildKey(name, domain)
+	val, _ := rm.nameIndex.LoadOrStore(indexKey, &sync.Map{})
+	keySet := val.(*sync.Map)
+	keySet.Store(cacheKey, struct{}{})
+}
+
+// invalidateCache 精准失效与指定 name 相关的缓存条目
+// 使用 nameIndex 索引直接定位相关缓存键，避免全量遍历
 func (rm *RoleManager) invalidateCache(name string, domain ...string) {
+	indexKey := rm.buildKey(name, domain)
+
+	// 精准删除：通过 nameIndex 找到所有关联的 cacheKey
+	if val, ok := rm.nameIndex.Load(indexKey); ok {
+		keySet := val.(*sync.Map)
+		keySet.Range(func(key, _ interface{}) bool {
+			rm.cache.Delete(key)
+			return true
+		})
+		// 清空 nameIndex 中该 name 的条目
+		rm.nameIndex.Delete(indexKey)
+	}
+
+	// 同时清除以该 name 为前缀的缓存（兼容旧数据）
 	prefix := rm.buildKey(name, domain)
-	rm.cache.Range(func(key string, value bool) bool {
-		if strings.Contains(key, prefix) {
+	rm.cache.Range(func(key, _ interface{}) bool {
+		if strings.Contains(key.(string), prefix) {
 			rm.cache.Delete(key)
 		}
 		return true

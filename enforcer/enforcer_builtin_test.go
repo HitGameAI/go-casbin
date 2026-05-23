@@ -1,3 +1,14 @@
+/*
+ * @Author: kamalyes 501893067@qq.com
+ * @Date: 2026-05-23 00:00:00
+ * @LastEditors: kamalyes 501893067@qq.com
+ * @LastEditTime: 2026-05-23 00:00:00
+ * @FilePath: \go-casbin\enforcer\enforcer_builtin_test.go
+ * @Description: 测试执行器内置函数集成
+ *
+ * Copyright (c) 2026 by kamalyes, All Rights Reserved.
+ */
+
 package enforcer
 
 import (

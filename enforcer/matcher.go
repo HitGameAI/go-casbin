@@ -31,6 +31,7 @@ type MatchContext struct {
 	Assertion     *model.Assertion          // 策略断言（包含字段名映射，如 p.sub/p.obj/p.act）
 	CustomFuncs   map[string]BuiltinFunc    // 自定义函数映射（如 eval() 函数）
 	ExtraPolicies map[string]*PolicySegment // 额外策略段映射（如 extra_policies）
+	ShortCircuit  bool                      // 短路优化：匹配到 allow 后立即返回（适用于 some(where(p.eft==allow)) 模式）
 }
 
 // PolicySegment 策略段
@@ -58,13 +59,16 @@ func NewMatcherEngine(log logger.ILogger) *MatcherEngine {
 // gFuncRegex 匹配 g() 函数调用，如 g(r.sub, p.sub) 或 g(r.sub, p.sub, r.dom)
 var gFuncRegex = regexp.MustCompile(`g\(([^,]+),\s*([^,)]+)(?:,\s*([^,)]+))?\)`)
 
+// evalRegex 匹配 eval() 函数调用，如 eval(p.sub_rule)
+var evalRegex = regexp.MustCompile(`eval\(([^)]+)\)`)
+
 // Match 执行匹配，返回是否匹配以及匹配策略的效果列表
 // 核心匹配流程：
 //   - 如果有策略，遍历每条策略评估 matcher 表达式
 //   - 如果没有策略（纯 ABAC 属性匹配），直接用请求参数评估 matcher
 func (me *MatcherEngine) Match(mc *MatchContext, matcherExpr string) (bool, []string, error) {
 	me.customFuncs = mc.CustomFuncs
-	matchedEffects := make([]string, 0)
+	matchedEffects := make([]string, 0, len(mc.Policies))
 
 	if len(mc.Policies) == 0 && len(mc.ExtraPolicies) == 0 {
 		vars := me.buildVariableMap(mc.Request, nil, nil)
@@ -94,6 +98,12 @@ func (me *MatcherEngine) Match(mc *MatchContext, matcherExpr string) (bool, []st
 		if me.evalExpr(expr, vars, mc.RoleMgr) {
 			eft := me.extractEffect(p, mc.Assertion)
 			matchedEffects = append(matchedEffects, eft)
+
+			// 短路优化：对于 some(where(p.eft==allow)) 模式，
+			// 匹配到第一条 allow 策略即可立即返回，无需遍历剩余策略
+			if mc.ShortCircuit && eft == "allow" {
+				return true, matchedEffects, nil
+			}
 		}
 	}
 
@@ -187,6 +197,11 @@ func (me *MatcherEngine) matchSingleSegment(mc *MatchContext, expr string, polic
 		if me.evalExpr(expandedExpr, vars, mc.RoleMgr) {
 			eft := me.extractEffect(p, assertion)
 			matchedEffects = append(matchedEffects, eft)
+
+			// 短路优化
+			if mc.ShortCircuit && eft == "allow" {
+				return true, matchedEffects, nil
+			}
 		}
 	}
 
@@ -205,8 +220,6 @@ func (me *MatcherEngine) exprReferencesSegment(expr string, segment string) bool
 // expandEval 将 eval(p.sub_rule) 替换为策略中对应的条件表达式值
 // 例如：eval(p.sub_rule) → r.sub == "alice"
 func (me *MatcherEngine) expandEval(expr string, vars map[string]interface{}) string {
-	// 匹配 eval(xxx) 模式
-	evalRegex := regexp.MustCompile(`eval\(([^)]+)\)`)
 	return evalRegex.ReplaceAllStringFunc(expr, func(match string) string {
 		// 提取括号内的变量名
 		inner := evalRegex.FindStringSubmatch(match)
@@ -422,7 +435,12 @@ func (me *MatcherEngine) evaluateRoleFunctionWithDomain(name1, name2, domain str
 // 将请求参数（r 段）和策略行（p 段）合并为一个统一的变量表
 // 例如：{r.sub: "alice", r.obj: "data1", p.sub: "admin", p.obj: "data1"}
 func (me *MatcherEngine) buildVariableMap(request map[string]interface{}, policyLine []string, assertion *model.Assertion) map[string]interface{} {
-	vars := make(map[string]interface{})
+	// 预分配容量：请求数 + 策略字段数
+	capacity := len(request)
+	if assertion != nil && len(policyLine) > 0 {
+		capacity += len(assertion.Tokens)
+	}
+	vars := make(map[string]interface{}, capacity)
 
 	for key, val := range request {
 		vars[key] = val

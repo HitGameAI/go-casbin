@@ -19,7 +19,6 @@ import (
 	"github.com/kamalyes/go-casbin/errors"
 	"github.com/kamalyes/go-logger"
 	"github.com/kamalyes/go-toolbox/pkg/stringx"
-	"github.com/kamalyes/go-toolbox/pkg/syncx"
 )
 
 type Config struct {
@@ -116,7 +115,9 @@ func (c *Config) GetAll() map[string]string {
 	defer c.mu.RUnlock()
 
 	result := make(map[string]string, len(c.data))
-	syncx.DeepCopy(c.data, &result)
+	for k, v := range c.data {
+		result[k] = v
+	}
 	return result
 }
 

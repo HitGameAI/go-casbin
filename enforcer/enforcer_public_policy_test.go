@@ -26,8 +26,8 @@ func TestPublicPolicy_RBACBasic(t *testing.T) {
 	e, err := NewEnforcer(
 		WithModelPath(rbacModelPath),
 		WithPublicPolicies([][]string{
-			{"anonymous", "/v1/login", "POST"},
-			{"anonymous", "/v1/refresh-token", "POST"},
+			{"/v1/login", "POST"},
+			{"/v1/refresh-token", "POST"},
 		}),
 		WithAutoSave(true),
 	)
@@ -75,13 +75,16 @@ func TestPublicPolicy_EmptyPolicies(t *testing.T) {
 
 func TestPublicPolicy_GetPublicPolicies(t *testing.T) {
 	expected := [][]string{
-		{"anonymous", "/v1/login", "POST"},
-		{"anonymous", "/v1/refresh-token", "POST"},
+		{SubjectAnonymous, "/v1/login", "POST"},
+		{SubjectAnonymous, "/v1/refresh-token", "POST"},
 	}
 
 	e, err := NewEnforcer(
 		WithModelPath(rbacModelPath),
-		WithPublicPolicies(expected),
+		WithPublicPolicies([][]string{
+			{"/v1/login", "POST"},
+			{"/v1/refresh-token", "POST"},
+		}),
 		WithAutoSave(true),
 	)
 	require.NoError(t, err)
@@ -100,7 +103,7 @@ func TestPublicPolicy_NotPersistedToAdapter(t *testing.T) {
 		WithModelPath(rbacModelPath),
 		WithAdapter(memAdapter),
 		WithPublicPolicies([][]string{
-			{"anonymous", "/v1/login", "POST"},
+			{"/v1/login", "POST"},
 		}),
 		WithAutoSave(true),
 	)
@@ -136,7 +139,7 @@ func TestPublicPolicy_ReloadPolicy(t *testing.T) {
 		WithModelPath(rbacModelPath),
 		WithAdapter(memAdapter),
 		WithPublicPolicies([][]string{
-			{"anonymous", "/v1/login", "POST"},
+			{"/v1/login", "POST"},
 		}),
 		WithAutoSave(true),
 	)
@@ -179,7 +182,7 @@ func TestPublicPolicy_LoadPolicy(t *testing.T) {
 		WithModelPath(rbacModelPath),
 		WithAdapter(memAdapter),
 		WithPublicPolicies([][]string{
-			{"anonymous", "/v1/login", "POST"},
+			{"/v1/login", "POST"},
 		}),
 		WithAutoSave(true),
 	)
@@ -205,8 +208,8 @@ func TestPublicPolicy_WithFileAdapter(t *testing.T) {
 		WithModelPath(rbacModelPath),
 		WithPolicyPath(filepath.Join("..", "resources", "rbac_policy.csv")),
 		WithPublicPolicies([][]string{
-			{"anonymous", "/v1/login", "POST"},
-			{"anonymous", "/v1/register", "POST"},
+			{"/v1/login", "POST"},
+			{"/v1/register", "POST"},
 		}),
 		WithAutoSave(false),
 	)
@@ -250,7 +253,7 @@ e = some(where (p.eft == allow))
 m = r.sub == p.sub && r.obj == p.obj && (r.act == p.act || p.act == "*")
 `),
 		WithPublicPolicies([][]string{
-			{"anonymous", "/healthz", "*"},
+			{"/healthz", "*"},
 		}),
 		WithAutoSave(false),
 	)
@@ -278,7 +281,7 @@ func TestPublicPolicy_RBACDomain(t *testing.T) {
 	e, err := NewEnforcer(
 		WithModelPath(rbacDomainModelPath),
 		WithPublicPolicies([][]string{
-			{"anonymous", "public", "/v1/login", "POST"},
+			{"public", "/v1/login", "POST"},
 		}),
 		WithAutoSave(true),
 	)
@@ -312,7 +315,7 @@ func TestPublicPolicy_CoexistWithNormalPolicy(t *testing.T) {
 		WithModelPath(rbacModelPath),
 		WithAdapter(memAdapter),
 		WithPublicPolicies([][]string{
-			{"anonymous", "/v1/login", "POST"},
+			{"/v1/login", "POST"},
 		}),
 		WithAutoSave(true),
 	)
@@ -345,7 +348,7 @@ func TestPublicPolicy_AddNormalPolicyAfterInit(t *testing.T) {
 	e, err := NewEnforcer(
 		WithModelPath(rbacModelPath),
 		WithPublicPolicies([][]string{
-			{"anonymous", "/v1/login", "POST"},
+			{"/v1/login", "POST"},
 		}),
 		WithAutoSave(true),
 	)
@@ -366,4 +369,172 @@ func TestPublicPolicy_AddNormalPolicyAfterInit(t *testing.T) {
 	ok, err = e.Enforce("alice", "/v1/users", "GET")
 	assert.NoError(t, err)
 	assert.True(t, ok)
+}
+
+// ==================== 认证免鉴权策略测试 ====================
+
+func TestAuthSkipPolicy_RBACBasic(t *testing.T) {
+	e, err := NewEnforcer(
+		WithModelPath(rbacModelPath),
+		WithAuthSkipPolicies([][]string{
+			{"/v1/auth/user-info", "GET"},
+			{"/v1/auth/refresh", "POST"},
+		}),
+		WithAutoSave(true),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, e)
+	t.Cleanup(func() { e.Close() })
+
+	// authenticated 可以访问认证免鉴权接口
+	ok, err := e.IsAuthSkipPolicy("/v1/auth/user-info", "GET")
+	assert.NoError(t, err)
+	assert.True(t, ok, "authenticated should access /v1/auth/user-info GET")
+
+	ok, err = e.IsAuthSkipPolicy("/v1/auth/refresh", "POST")
+	assert.NoError(t, err)
+	assert.True(t, ok, "authenticated should access /v1/auth/refresh POST")
+
+	// authenticated 不能访问非免鉴权接口
+	ok, err = e.IsAuthSkipPolicy("/v1/users", "GET")
+	assert.NoError(t, err)
+	assert.False(t, ok, "authenticated should not access /v1/users via auth-skip")
+
+	ok, err = e.IsAuthSkipPolicy("/v1/auth/user-info", "DELETE")
+	assert.NoError(t, err)
+	assert.False(t, ok, "authenticated should not access /v1/auth/user-info DELETE")
+}
+
+func TestAuthSkipPolicy_EmptyPolicies(t *testing.T) {
+	e, err := NewEnforcer(
+		WithModelPath(rbacModelPath),
+		WithAutoSave(true),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, e)
+	t.Cleanup(func() { e.Close() })
+
+	// 没有配置认证免鉴权策略时，所有路径都不是免鉴权的
+	ok, err := e.IsAuthSkipPolicy("/v1/auth/user-info", "GET")
+	assert.NoError(t, err)
+	assert.False(t, ok)
+
+	policies := e.GetAuthSkipPolicies()
+	assert.Empty(t, policies)
+}
+
+func TestAuthSkipPolicy_GetAuthSkipPolicies(t *testing.T) {
+	expected := [][]string{
+		{SubjectAuthenticated, "/v1/auth/user-info", "GET"},
+	}
+
+	e, err := NewEnforcer(
+		WithModelPath(rbacModelPath),
+		WithAuthSkipPolicies([][]string{
+			{"/v1/auth/user-info", "GET"},
+		}),
+		WithAutoSave(true),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, e)
+	t.Cleanup(func() { e.Close() })
+
+	policies := e.GetAuthSkipPolicies()
+	assert.Len(t, policies, 1)
+	assert.Equal(t, expected, policies)
+}
+
+func TestAuthSkipPolicy_NotPersistedToAdapter(t *testing.T) {
+	memAdapter := policy.NewMemoryAdapter()
+
+	e, err := NewEnforcer(
+		WithModelPath(rbacModelPath),
+		WithAdapter(memAdapter),
+		WithAuthSkipPolicies([][]string{
+			{"/v1/auth/user-info", "GET"},
+		}),
+		WithAutoSave(true),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, e)
+	t.Cleanup(func() { e.Close() })
+
+	// 认证免鉴权策略在内存中生效
+	ok, err := e.IsAuthSkipPolicy("/v1/auth/user-info", "GET")
+	assert.NoError(t, err)
+	assert.True(t, ok)
+
+	// 适配器中不应包含 authenticated 的策略
+	savedPolicies, err := memAdapter.LoadPolicy()
+	require.NoError(t, err)
+	for _, p := range savedPolicies {
+		if strings.HasPrefix(p, "p, authenticated,") {
+			t.Fatalf("auth-skip policy should not be persisted to adapter, got: %s", p)
+		}
+	}
+}
+
+func TestAuthSkipPolicy_ReloadPolicy(t *testing.T) {
+	memAdapter := policy.NewMemoryAdapter()
+
+	err := memAdapter.SavePolicy([]string{
+		"p, alice, data1, read",
+	})
+	require.NoError(t, err)
+
+	e, err := NewEnforcer(
+		WithModelPath(rbacModelPath),
+		WithAdapter(memAdapter),
+		WithAuthSkipPolicies([][]string{
+			{"/v1/auth/user-info", "GET"},
+		}),
+		WithAutoSave(true),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, e)
+	t.Cleanup(func() { e.Close() })
+
+	// ReloadPolicy 后认证免鉴权策略应该仍然生效
+	err = e.ReloadPolicy()
+	require.NoError(t, err)
+
+	ok, err := e.IsAuthSkipPolicy("/v1/auth/user-info", "GET")
+	assert.NoError(t, err)
+	assert.True(t, ok, "auth-skip policy should still work after ReloadPolicy")
+}
+
+func TestAuthSkipPolicy_CoexistWithPublicPolicy(t *testing.T) {
+	e, err := NewEnforcer(
+		WithModelPath(rbacModelPath),
+		WithPublicPolicies([][]string{
+			{"/v1/login", "POST"},
+		}),
+		WithAuthSkipPolicies([][]string{
+			{"/v1/auth/user-info", "GET"},
+		}),
+		WithAutoSave(true),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, e)
+	t.Cleanup(func() { e.Close() })
+
+	// 公开策略生效
+	ok, err := e.IsPublicPolicy("/v1/login", "POST")
+	assert.NoError(t, err)
+	assert.True(t, ok)
+
+	// 认证免鉴权策略生效
+	ok, err = e.IsAuthSkipPolicy("/v1/auth/user-info", "GET")
+	assert.NoError(t, err)
+	assert.True(t, ok)
+
+	// 互不干扰：公开接口不是免鉴权接口
+	ok, err = e.IsAuthSkipPolicy("/v1/login", "POST")
+	assert.NoError(t, err)
+	assert.False(t, ok, "/v1/login is public but not auth-skip")
+
+	// 免鉴权接口不是公开接口
+	ok, err = e.IsPublicPolicy("/v1/auth/user-info", "GET")
+	assert.NoError(t, err)
+	assert.False(t, ok, "/v1/auth/user-info is auth-skip but not public")
 }

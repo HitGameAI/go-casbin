@@ -23,20 +23,32 @@ import (
 // 负责策略的加载、保存、增删改查操作
 // 支持自动保存、缓存失效、适配器回退等机制
 type Policy struct {
-	model   *model.Model   // 关联的权限模型
-	adapter Adapter        // 策略存储适配器
-	cache   *PolicyCache   // 策略缓存（基于 syncx.Map）
-	logger  logger.ILogger // 日志记录器
+	model    *model.Model   // 关联的权限模型
+	adapter  Adapter        // 策略存储适配器
+	cache    *PolicyCache   // 策略缓存（基于 syncx.Map）
+	logger   logger.ILogger // 日志记录器
+	autoSave bool           // 是否自动持久化到适配器（默认 true）
 }
 
 // NewPolicy 创建策略管理器
 func NewPolicy(m *model.Model, adapter Adapter, log logger.ILogger) *Policy {
 	return &Policy{
-		model:   m,
-		adapter: adapter,
-		cache:   NewPolicyCache(),
-		logger:  log,
+		model:    m,
+		adapter:  adapter,
+		cache:    NewPolicyCache(),
+		logger:   log,
+		autoSave: true,
 	}
+}
+
+// SetAutoSave 设置是否自动持久化到适配器
+func (p *Policy) SetAutoSave(autoSave bool) {
+	p.autoSave = autoSave
+}
+
+// IsAutoSave 返回是否自动持久化到适配器
+func (p *Policy) IsAutoSave() bool {
+	return p.autoSave
 }
 
 // LoadPolicy 从适配器加载所有策略到内存模型
@@ -128,7 +140,7 @@ func (p *Policy) AddPolicy(sec, ptype string, policy []string) error {
 
 	assertion.AddPolicy(policy)
 
-	if p.adapter != nil {
+	if p.autoSave && p.adapter != nil {
 		line := ptype + ", " + strings.Join(policy, ", ")
 		if err := p.adapter.AddPolicy(line); err != nil {
 			assertion.RemovePolicy(policy)
@@ -163,7 +175,7 @@ func (p *Policy) AddPolicies(sec, ptype string, rules [][]string) error {
 		assertion.AddPolicy(rule)
 	}
 
-	if p.adapter != nil {
+	if p.autoSave && p.adapter != nil {
 		if ba, ok := p.adapter.(BatchAdapter); ok {
 			var lines []string
 			for _, rule := range toAdd {
@@ -225,7 +237,7 @@ func (p *Policy) RemovePolicy(sec, ptype string, policy []string) error {
 		return errors.NewPolicyNotFoundError(strings.Join(policy, ", "))
 	}
 
-	if p.adapter != nil {
+	if p.autoSave && p.adapter != nil {
 		line := ptype + ", " + strings.Join(policy, ", ")
 		if err := p.adapter.RemovePolicy(line); err != nil {
 			assertion.AddPolicy(policy)
@@ -252,7 +264,7 @@ func (p *Policy) RemovePolicies(sec, ptype string, rules [][]string) error {
 		}
 	}
 
-	if p.adapter != nil {
+	if p.autoSave && p.adapter != nil {
 		if ba, ok := p.adapter.(BatchAdapter); ok {
 			var lines []string
 			for _, rule := range removed {
@@ -319,7 +331,7 @@ func (p *Policy) RemoveFilteredPolicy(sec, ptype string, fieldIndex int, fieldVa
 		assertion.AddPolicy(r)
 	}
 
-	if p.adapter != nil {
+	if p.autoSave && p.adapter != nil {
 		if ua, ok := p.adapter.(UpdatableAdapter); ok {
 			var newLines []string
 			for _, r := range remaining {
@@ -356,7 +368,7 @@ func (p *Policy) UpdatePolicy(sec, ptype string, oldPolicy, newPolicy []string) 
 	assertion.RemovePolicy(oldPolicy)
 	assertion.AddPolicy(newPolicy)
 
-	if p.adapter != nil {
+	if p.autoSave && p.adapter != nil {
 		oldLine := ptype + ", " + strings.Join(oldPolicy, ", ")
 		newLine := ptype + ", " + strings.Join(newPolicy, ", ")
 		if ua, ok := p.adapter.(UpdatableAdapter); ok {
@@ -391,7 +403,7 @@ func (p *Policy) UpdatePolicies(sec, ptype string, oldPolicies, newPolicies [][]
 		assertion.AddPolicy(newP)
 	}
 
-	if p.adapter != nil {
+	if p.autoSave && p.adapter != nil {
 		if ua, ok := p.adapter.(UpdatableAdapter); ok {
 			var oldLines, newLines []string
 			for i, old := range oldPolicies {

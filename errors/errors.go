@@ -48,6 +48,7 @@ const (
 	ErrTypePolicyBatchUpdateFailed                                // 批量更新策略失败
 	ErrTypePolicyAutoMigrateFailed                                // 自动迁移策略表失败
 	ErrTypePolicyGetByTypeFailed                                  // 按类型获取策略失败
+	ErrTypePolicyRuleInvalid                                      // 策略规则无效
 )
 
 // ==================== 角色错误类型（2200-2203） ====================
@@ -59,7 +60,7 @@ const (
 	ErrTypeRoleHierarchyFailed                                // 角色层级错误
 )
 
-// ==================== 执行器错误类型（2300-2304） ====================
+// ==================== 执行器错误类型（2300-2305） ====================
 
 const (
 	ErrTypeEnforcerNotReady       errorx.ErrorType = 2300 + iota // 执行器未就绪
@@ -67,6 +68,7 @@ const (
 	ErrTypeEnforcerMatcherFailed                                 // 匹配器执行失败
 	ErrTypeEnforcerBreakerOpen                                   // 熔断器已开启
 	ErrTypeEnforcerRetryExhausted                                // 重试次数耗尽
+	ErrTypeEnforcerInvalidRequest                                // 请求参数无效
 )
 
 // ==================== 配置错误类型（2400-2402） ====================
@@ -114,6 +116,7 @@ func init() {
 	errorx.RegisterError(ErrTypePolicyBatchUpdateFailed, "failed to batch update policy: %s")
 	errorx.RegisterError(ErrTypePolicyAutoMigrateFailed, "failed to auto migrate policy table: %s")
 	errorx.RegisterError(ErrTypePolicyGetByTypeFailed, "failed to get policy by type: %s")
+	errorx.RegisterError(ErrTypePolicyRuleInvalid, "invalid policy rule: %s")
 
 	// 角色相关错误
 	errorx.RegisterError(ErrTypeRoleNotFound, "role not found: %s")
@@ -127,6 +130,7 @@ func init() {
 	errorx.RegisterError(ErrTypeEnforcerMatcherFailed, "matcher execution failed: %s")
 	errorx.RegisterError(ErrTypeEnforcerBreakerOpen, "circuit breaker is open: %s")
 	errorx.RegisterError(ErrTypeEnforcerRetryExhausted, "retry attempts exhausted: %s")
+	errorx.RegisterError(ErrTypeEnforcerInvalidRequest, "invalid enforce request: %s")
 
 	// 配置相关错误
 	errorx.RegisterError(ErrTypeConfigLoadFailed, "failed to load config: %s")
@@ -266,6 +270,11 @@ func NewPolicyGetByTypeFailedError(detail string) error {
 	return errorx.NewError(ErrTypePolicyGetByTypeFailed, detail)
 }
 
+// NewPolicyRuleInvalidError 创建策略规则无效错误
+func NewPolicyRuleInvalidError(detail string) error {
+	return errorx.NewError(ErrTypePolicyRuleInvalid, detail)
+}
+
 // ==================== 角色错误构造函数 ====================
 
 // NewRoleNotFoundError 创建角色未找到错误
@@ -313,6 +322,11 @@ func NewEnforcerBreakerOpenError(detail string) error {
 // NewEnforcerRetryExhaustedError 创建重试次数耗尽错误
 func NewEnforcerRetryExhaustedError(detail string) error {
 	return errorx.NewError(ErrTypeEnforcerRetryExhausted, detail)
+}
+
+// NewEnforcerInvalidRequestError 创建请求参数无效错误
+func NewEnforcerInvalidRequestError(detail string) error {
+	return errorx.NewError(ErrTypeEnforcerInvalidRequest, detail)
 }
 
 // ==================== 配置错误构造函数 ====================
