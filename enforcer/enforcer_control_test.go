@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-03-28 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-03-28 00:00:00
+ * @LastEditTime: 2026-05-23 23:17:00
  * @FilePath: \go-casbin\enforcer\enforcer_control_test.go
  * @Description: 测试控制模型
  *
@@ -159,4 +159,118 @@ func TestEnforcerGetAllUsers(t *testing.T) {
 
 	users := e.GetAllUsers()
 	assert.NotEmpty(t, users)
+}
+
+// ==================== Self API 测试 ====================
+
+func TestSelfAddPolicy(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	initialCount := len(e.GetPolicy())
+
+	err := e.SelfAddPolicy("p", "p", []string{"eve", "data3", "read"})
+	assert.NoError(t, err)
+	assert.Equal(t, initialCount+1, len(e.GetPolicy()))
+}
+
+func TestSelfAddPolicy_Invalid(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	err := e.SelfAddPolicy("p", "p", []string{"", "data3", "read"})
+	assert.Error(t, err)
+}
+
+func TestSelfAddPolicies(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	initialCount := len(e.GetPolicy())
+
+	err := e.SelfAddPolicies("p", "p", [][]string{
+		{"eve", "data3", "read"},
+		{"carol", "data4", "write"},
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, initialCount+2, len(e.GetPolicy()))
+}
+
+func TestSelfAddPoliciesEx(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// 添加已存在的策略应跳过
+	err := e.SelfAddPoliciesEx("p", "p", [][]string{
+		{"alice", "data1", "read"},
+		{"eve", "data3", "read"},
+	})
+	assert.NoError(t, err)
+}
+
+func TestSelfRemovePolicy(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	initialCount := len(e.GetPolicy())
+
+	err := e.SelfRemovePolicy("p", "p", []string{"alice", "data1", "read"})
+	assert.NoError(t, err)
+	assert.Equal(t, initialCount-1, len(e.GetPolicy()))
+}
+
+func TestSelfRemovePolicies(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	initialCount := len(e.GetPolicy())
+
+	err := e.SelfRemovePolicies("p", "p", [][]string{
+		{"alice", "data1", "read"},
+		{"alice", "data1", "write"},
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, initialCount-2, len(e.GetPolicy()))
+}
+
+func TestSelfRemoveFilteredPolicy(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	initialCount := len(e.GetPolicy())
+
+	err := e.SelfRemoveFilteredPolicy("p", "p", 0, "alice")
+	assert.NoError(t, err)
+	assert.Less(t, len(e.GetPolicy()), initialCount)
+}
+
+func TestSelfUpdatePolicy(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	err := e.SelfUpdatePolicy("p", "p",
+		[]string{"alice", "data1", "read"},
+		[]string{"alice", "data1", "write"})
+	assert.NoError(t, err)
+
+	ok, _ := e.Enforce("alice", "data1", "write")
+	assert.True(t, ok)
+}
+
+func TestSelfUpdatePolicies(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	err := e.SelfUpdatePolicies("p", "p",
+		[][]string{{"alice", "data1", "read"}, {"alice", "data1", "write"}},
+		[][]string{{"alice", "data2", "read"}, {"alice", "data2", "write"}})
+	assert.NoError(t, err)
+}
+
+func TestHasNamedGroupingPolicy(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	assert.True(t, e.HasNamedGroupingPolicy("g", "alice", "admin"))
+	assert.False(t, e.HasNamedGroupingPolicy("g", "nobody", "admin"))
 }
