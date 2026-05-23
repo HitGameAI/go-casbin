@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-03-28 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-03-28 00:00:00
+ * @LastEditTime: 2026-05-23 22:17:23
  * @FilePath: \go-casbin\role\manager.go
  * @Description: 角色管理器（含域支持、隐式查询、缓存）
  *
@@ -66,6 +66,7 @@ func (rm *RoleManager) AddLink(name1, name2 string, domain ...string) error {
 	}
 
 	rm.invalidateCache(name1, domain...)
+	rm.invalidateCache(name2, domain...)
 	rm.logger.InfoKV("Role link added", "name1", name1, "name2", name2)
 	return nil
 }
@@ -78,6 +79,7 @@ func (rm *RoleManager) DeleteLink(name1, name2 string, domain ...string) {
 
 	rm.hierarchy.DeleteLink(n1, n2)
 	rm.invalidateCache(name1, domain...)
+	rm.invalidateCache(name2, domain...)
 	rm.logger.InfoKV("Role link deleted", "name1", name1, "name2", name2)
 }
 
@@ -278,13 +280,4 @@ func (rm *RoleManager) invalidateCache(name string, domain ...string) {
 		// 清空 nameIndex 中该 name 的条目
 		rm.nameIndex.Delete(indexKey)
 	}
-
-	// 同时清除以该 name 为前缀的缓存（兼容旧数据）
-	prefix := rm.buildKey(name, domain)
-	rm.cache.Range(func(key, _ interface{}) bool {
-		if strings.Contains(key.(string), prefix) {
-			rm.cache.Delete(key)
-		}
-		return true
-	})
 }

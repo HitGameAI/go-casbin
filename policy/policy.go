@@ -338,6 +338,14 @@ func (p *Policy) RemoveFilteredPolicy(sec, ptype string, fieldIndex int, fieldVa
 				newLines = append(newLines, ptype+", "+strings.Join(r, ", "))
 			}
 			if err := ua.UpdateFilteredPolicies(newLines, fieldIndex, fieldValues...); err != nil {
+				// 回滚内存：恢复被删除的策略
+				assertion.ClearPolicies()
+				for _, r := range removed {
+					assertion.AddPolicy(r)
+				}
+				for _, r := range remaining {
+					assertion.AddPolicy(r)
+				}
 				return errors.WrapError("RemoveFilteredPolicy", err)
 			}
 		} else {
@@ -390,12 +398,14 @@ func (p *Policy) UpdatePolicy(sec, ptype string, oldPolicy, newPolicy []string) 
 
 // UpdatePolicies 批量更新策略
 // 先删除旧策略，再添加新策略，支持适配器回退
+// 适配器写入失败时会回滚内存中的策略变更
 func (p *Policy) UpdatePolicies(sec, ptype string, oldPolicies, newPolicies [][]string) error {
 	assertion := p.model.GetAssertion(ptype)
 	if assertion == nil {
 		return errors.NewPolicyNotFoundError(ptype)
 	}
 
+	// 先在内存中执行变更
 	for _, old := range oldPolicies {
 		assertion.RemovePolicy(old)
 	}
@@ -411,14 +421,36 @@ func (p *Policy) UpdatePolicies(sec, ptype string, oldPolicies, newPolicies [][]
 				newLines = append(newLines, ptype+", "+strings.Join(newPolicies[i], ", "))
 			}
 			if err := ua.UpdatePolicies(oldLines, newLines); err != nil {
+				// 回滚内存：撤销变更
+				for _, newP := range newPolicies {
+					assertion.RemovePolicy(newP)
+				}
+				for _, old := range oldPolicies {
+					assertion.AddPolicy(old)
+				}
 				return errors.WrapError("UpdatePolicies", err)
 			}
 		} else {
+			// 非批量适配器：逐条操作，失败时回滚
+			for i, newP := range newPolicies {
+				line := ptype + ", " + strings.Join(newP, ", ")
+				if err := p.adapter.AddPolicy(line); err != nil {
+					// 回滚已添加的新策略
+					for j := 0; j < i; j++ {
+						_ = p.adapter.RemovePolicy(ptype + ", " + strings.Join(newPolicies[j], ", "))
+					}
+					// 回滚内存
+					for _, np := range newPolicies {
+						assertion.RemovePolicy(np)
+					}
+					for _, old := range oldPolicies {
+						assertion.AddPolicy(old)
+					}
+					return errors.WrapError("UpdatePolicies", err)
+				}
+			}
 			for _, old := range oldPolicies {
 				_ = p.adapter.RemovePolicy(ptype + ", " + strings.Join(old, ", "))
-			}
-			for _, newP := range newPolicies {
-				_ = p.adapter.AddPolicy(ptype + ", " + strings.Join(newP, ", "))
 			}
 		}
 	}
