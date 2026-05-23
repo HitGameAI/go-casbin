@@ -219,6 +219,7 @@ func (me *MatcherEngine) exprReferencesSegment(expr string, segment string) bool
 
 // expandEval 将 eval(p.sub_rule) 替换为策略中对应的条件表达式值
 // 例如：eval(p.sub_rule) → r.sub == "alice"
+// 安全防护：对展开的值进行校验，防止注入恶意表达式
 func (me *MatcherEngine) expandEval(expr string, vars map[string]interface{}) string {
 	return evalRegex.ReplaceAllStringFunc(expr, func(match string) string {
 		// 提取括号内的变量名
@@ -228,10 +229,30 @@ func (me *MatcherEngine) expandEval(expr string, vars map[string]interface{}) st
 		}
 		varName := strings.TrimSpace(inner[1])
 		if val, ok := vars[varName]; ok {
-			return fmt.Sprintf("%v", val)
+			expanded := valueToString(val)
+			// 安全校验：拒绝包含危险操作符的 eval 值，防止表达式注入
+			if containsDangerousExpr(expanded) {
+				me.logger.WarnKV("Dangerous eval expression blocked", "value", expanded)
+				return "false"
+			}
+			return expanded
 		}
 		return match
 	})
+}
+
+// containsDangerousExpr 检查表达式值是否包含危险操作符
+// 防止通过策略字段注入恶意代码（如系统调用、文件操作等）
+func containsDangerousExpr(expr string) bool {
+	dangerous := []string{"os.", "runtime.", "exec(", "system(", "import(", "panic(",
+		"recover(", "unsafe.", "reflect.", "syscall."}
+	lower := strings.ToLower(expr)
+	for _, d := range dangerous {
+		if strings.Contains(lower, d) {
+			return true
+		}
+	}
+	return false
 }
 
 // extractEffect 从策略行中提取 eft（效果）字段
@@ -320,19 +341,17 @@ func (me *MatcherEngine) evalExpr(expr string, vars map[string]interface{}, role
 	}
 
 	// 处理 == 比较
-	if strings.Contains(expr, "==") {
-		parts := strings.SplitN(expr, "==", 2)
-		left := me.resolveValue(strings.TrimSpace(parts[0]), vars)
-		right := me.resolveValue(strings.TrimSpace(parts[1]), vars)
-		return fmt.Sprintf("%v", left) == fmt.Sprintf("%v", right)
+	if idx := strings.Index(expr, "=="); idx >= 0 {
+		left := me.resolveValue(strings.TrimSpace(expr[:idx]), vars)
+		right := me.resolveValue(strings.TrimSpace(expr[idx+2:]), vars)
+		return valueToString(left) == valueToString(right)
 	}
 
 	// 处理 != 比较
-	if strings.Contains(expr, "!=") {
-		parts := strings.SplitN(expr, "!=", 2)
-		left := me.resolveValue(strings.TrimSpace(parts[0]), vars)
-		right := me.resolveValue(strings.TrimSpace(parts[1]), vars)
-		return fmt.Sprintf("%v", left) != fmt.Sprintf("%v", right)
+	if idx := strings.Index(expr, "!="); idx >= 0 {
+		left := me.resolveValue(strings.TrimSpace(expr[:idx]), vars)
+		right := me.resolveValue(strings.TrimSpace(expr[idx+2:]), vars)
+		return valueToString(left) != valueToString(right)
 	}
 
 	// 处理 in 运算符：r.sub in ("alice","bob")
@@ -374,7 +393,7 @@ func (me *MatcherEngine) evalInExpr(expr string, vars map[string]interface{}) bo
 	leftToken := strings.TrimSpace(expr[:inIdx])
 	rightPart := strings.TrimSpace(expr[inIdx+4:])
 
-	leftVal := fmt.Sprintf("%v", me.resolveValue(leftToken, vars))
+	leftVal := valueToString(me.resolveValue(leftToken, vars))
 
 	if !strings.HasPrefix(rightPart, "(") || !strings.HasSuffix(rightPart, ")") {
 		return false
@@ -404,11 +423,11 @@ func (me *MatcherEngine) evalGFunction(expr string, vars map[string]interface{},
 	name1Raw := strings.TrimSpace(matches[1])
 	name2Raw := strings.TrimSpace(matches[2])
 
-	name1 := fmt.Sprintf("%v", me.resolveValue(name1Raw, vars))
-	name2 := fmt.Sprintf("%v", me.resolveValue(name2Raw, vars))
+	name1 := valueToString(me.resolveValue(name1Raw, vars))
+	name2 := valueToString(me.resolveValue(name2Raw, vars))
 
 	if len(matches) >= 4 && matches[3] != "" {
-		domain := fmt.Sprintf("%v", me.resolveValue(strings.TrimSpace(matches[3]), vars))
+		domain := valueToString(me.resolveValue(strings.TrimSpace(matches[3]), vars))
 		return me.evaluateRoleFunctionWithDomain(name1, name2, domain, roleMgr)
 	}
 
@@ -560,4 +579,17 @@ func (me *MatcherEngine) resolveValue(token string, vars map[string]interface{})
 	}
 
 	return token
+}
+
+// valueToString 将 interface{} 转为字符串，避免 fmt.Sprintf 的反射和分配开销
+// 热路径上每条策略的 == 和 != 比较都会调用此函数
+func valueToString(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", val)
+	}
 }
