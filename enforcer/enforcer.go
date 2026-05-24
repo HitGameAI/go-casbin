@@ -392,6 +392,8 @@ func (e *Enforcer) doEnforceWithMatcher(ctx context.Context, matcherExpr string,
 		CustomFuncs:   e.customFuncs,
 		ExtraPolicies: e.getExtraPolicies(),
 		ShortCircuit:  e.shortCircuit,
+		HasEval:       strings.Contains(expr, "eval("),
+		HasGFunc:      strings.Contains(expr, "g("),
 	}
 
 	matched, matchedEffects, err := e.matcher.Match(mc, expr)
@@ -449,6 +451,8 @@ func (e *Enforcer) enforceExWithMatcherExpr(matcherExpr string, rvals ...interfa
 		CustomFuncs:   e.customFuncs,
 		ExtraPolicies: e.getExtraPolicies(),
 		ShortCircuit:  e.shortCircuit,
+		HasEval:       strings.Contains(expr, "eval("),
+		HasGFunc:      strings.Contains(expr, "g("),
 	}
 
 	matched, matchedEffects, err := e.matcher.Match(mc, expr)
@@ -2019,8 +2023,10 @@ func (e *Enforcer) doEnforce(ctx context.Context, rvals ...interface{}) (bool, e
 		RoleMgr:       e.roleMgr,
 		Assertion:     policyAssertion,
 		CustomFuncs:   e.customFuncs,
-		ExtraPolicies: e.getExtraPolicies(), // 使用缓存的 extraPolicies
-		ShortCircuit:  e.shortCircuit,       // 短路优化：some(where(p.eft==allow)) 模式下匹配到即返回
+		ExtraPolicies: e.getExtraPolicies(),                   // 使用缓存的 extraPolicies
+		ShortCircuit:  e.shortCircuit,                         // 短路优化：some(where(p.eft==allow)) 模式下匹配到即返回
+		HasEval:       strings.Contains(matcherExpr, "eval("), // 预计算，避免每条策略重复扫描
+		HasGFunc:      strings.Contains(matcherExpr, "g("),    // 预计算，避免每条策略重复扫描
 	}
 
 	matched, matchedEffects, err := e.matcher.Match(mc, matcherExpr)

@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-03-28 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-03-28 00:00:00
+ * @LastEditTime: 2026-05-25 01:10:58
  * @FilePath: \go-casbin\enforcer\matcher.go
  * @Description: 匹配引擎（基于 go-toolbox）
  *
@@ -32,6 +32,8 @@ type MatchContext struct {
 	CustomFuncs   map[string]BuiltinFunc    // 自定义函数映射（如 eval() 函数）
 	ExtraPolicies map[string]*PolicySegment // 额外策略段映射（如 extra_policies）
 	ShortCircuit  bool                      // 短路优化：匹配到 allow 后立即返回（适用于 some(where(p.eft==allow)) 模式）
+	HasEval       bool                      // 表达式是否包含 eval()（预计算，避免每条策略重复 strings.Contains）
+	HasGFunc      bool                      // 表达式是否包含 g()（预计算，避免每条策略重复 strings.Contains）
 }
 
 // PolicySegment 策略段
@@ -70,10 +72,14 @@ func (me *MatcherEngine) Match(mc *MatchContext, matcherExpr string) (bool, []st
 	me.customFuncs = mc.CustomFuncs
 	matchedEffects := make([]string, 0, len(mc.Policies))
 
+	// 预计算表达式特征，避免每条策略重复 strings.Contains
+	hasEval := mc.HasEval
+	_ = mc.HasGFunc // g() 特征由 evalExpr 内部处理
+
 	if len(mc.Policies) == 0 && len(mc.ExtraPolicies) == 0 {
 		vars := me.buildVariableMap(mc.Request, nil, nil)
 		expr := matcherExpr
-		if strings.Contains(expr, "eval(") {
+		if hasEval {
 			expr = me.expandEval(expr, vars)
 		}
 		if me.evalExpr(expr, vars, mc.RoleMgr) {
@@ -91,7 +97,7 @@ func (me *MatcherEngine) Match(mc *MatchContext, matcherExpr string) (bool, []st
 
 		expr := matcherExpr
 
-		if strings.Contains(expr, "eval(") {
+		if hasEval {
 			expr = me.expandEval(expr, vars)
 		}
 
@@ -176,10 +182,12 @@ func (me *MatcherEngine) matchSingleSegment(mc *MatchContext, expr string, polic
 		matchedEffects = make([]string, 0)
 	}
 
+	hasEval := mc.HasEval
+
 	if len(policies) == 0 {
 		vars := me.buildVariableMap(mc.Request, nil, nil)
 		expandedExpr := expr
-		if strings.Contains(expandedExpr, "eval(") {
+		if hasEval {
 			expandedExpr = me.expandEval(expandedExpr, vars)
 		}
 		if me.evalExpr(expandedExpr, vars, mc.RoleMgr) {
@@ -191,7 +199,7 @@ func (me *MatcherEngine) matchSingleSegment(mc *MatchContext, expr string, polic
 	for _, p := range policies {
 		vars := me.buildVariableMap(mc.Request, p, assertion)
 		expandedExpr := expr
-		if strings.Contains(expandedExpr, "eval(") {
+		if hasEval {
 			expandedExpr = me.expandEval(expandedExpr, vars)
 		}
 		if me.evalExpr(expandedExpr, vars, mc.RoleMgr) {
@@ -302,16 +310,13 @@ func (me *MatcherEngine) evalExpr(expr string, vars map[string]interface{}, role
 		}
 	}
 
-	// 处理 || （逻辑或）— 优先级低于 &&，先拆分
-	// 必须在 && 之前处理，确保 a && b || c && d 被解析为 (a && b) || (c && d)
-	if topOr := me.findTopLevelOp(expr, "||"); topOr >= 0 {
+	// 处理 || 和 && — 单次遍历查找顶层运算符
+	// || 优先级低于 &&，先拆分 || 确保 a && b || c && d 被解析为 (a && b) || (c && d)
+	if topOr, topAnd := me.findTopLevelOps(expr); topOr >= 0 {
 		left := expr[:topOr]
 		right := expr[topOr+2:]
 		return me.evalExpr(left, vars, roleMgr) || me.evalExpr(right, vars, roleMgr)
-	}
-
-	// 处理 && （逻辑与）— 优先级高于 ||
-	if topAnd := me.findTopLevelOp(expr, "&&"); topAnd >= 0 {
+	} else if topAnd >= 0 {
 		left := expr[:topAnd]
 		right := expr[topAnd+2:]
 		return me.evalExpr(left, vars, roleMgr) && me.evalExpr(right, vars, roleMgr)
@@ -360,6 +365,33 @@ func (me *MatcherEngine) evalExpr(expr string, vars map[string]interface{}, role
 	}
 
 	return false
+}
+
+// findTopLevelOps 单次遍历同时查找顶层 || 和 && 运算符位置
+// 返回 (orPos, andPos)，-1 表示未找到
+// 合并两次遍历为一次，减少热路径上的字符串扫描开销
+func (me *MatcherEngine) findTopLevelOps(expr string) (int, int) {
+	depth := 0
+	orPos := -1
+	andPos := -1
+	for i := 0; i < len(expr); i++ {
+		ch := expr[i]
+		switch ch {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		}
+		if depth == 0 && i+1 < len(expr) {
+			two := expr[i : i+2]
+			if two == "||" && orPos < 0 {
+				orPos = i
+			} else if two == "&&" && andPos < 0 {
+				andPos = i
+			}
+		}
+	}
+	return orPos, andPos
 }
 
 // findTopLevelOp 查找顶层（不在括号内）的运算符位置

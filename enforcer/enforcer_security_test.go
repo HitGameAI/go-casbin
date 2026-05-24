@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2026-05-23 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2026-05-23 23:06:19
+ * @LastEditTime: 2026-05-23 23:21:23
  * @FilePath: \go-casbin\enforcer\enforcer_security_test.go
  * @Description: 测试执行器安全校验
  *

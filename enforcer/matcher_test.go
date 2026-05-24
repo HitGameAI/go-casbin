@@ -248,6 +248,7 @@ func TestMatcherEngine_Match_EvalExpression(t *testing.T) {
 		},
 		Assertion:   assertion,
 		CustomFuncs: map[string]BuiltinFunc{},
+		HasEval:     true,
 	}
 
 	ok, effects, err := me.Match(mc, "eval(p.sub_rule) && r.obj == p.obj && r.act == p.act")
