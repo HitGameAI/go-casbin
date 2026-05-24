@@ -959,3 +959,270 @@ func TestEvaluateEffect_MixedAllowDeny(t *testing.T) {
 	// some(where(p.eft==allow)) 模式下，有 allow 即通过
 	assert.True(t, bool(result))
 }
+
+// ==================== SetNotifier Subscribe 失败测试 ====================
+
+func TestSetNotifier_SubscribeError(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+
+	// 创建一个 Subscribe 会失败的通知器
+	notifier := &failingNotifier{}
+	err := e.SetNotifier(notifier)
+	assert.Error(t, err)
+}
+
+// failingNotifier Subscribe 总是失败的通知器
+type failingNotifier struct{}
+
+func (f *failingNotifier) Publish(ctx context.Context, event *policy.ChangeEvent) error {
+	return fmt.Errorf("publish failed")
+}
+
+func (f *failingNotifier) Subscribe(ctx context.Context, handler policy.ChangeEventHandler) error {
+	return fmt.Errorf("subscribe failed")
+}
+
+func (f *failingNotifier) Unsubscribe() error {
+	return nil
+}
+
+func (f *failingNotifier) Close() error {
+	return nil
+}
+
+// ==================== doEnforce panic recover 测试 ====================
+
+func TestDoEnforce_PanicRecovery(t *testing.T) {
+	m := model.NewModel(logger.NoLogger)
+	_ = m.AddDef("r", "sub, obj, act")
+	_ = m.AddDef("p", "sub, obj, act")
+	_ = m.AddDef("e", "some(where (p.eft == allow))")
+	_ = m.AddDef("m", securityMatcherSimple)
+
+	e := &Enforcer{
+		model:         m,
+		logger:        logger.NoLogger,
+		matcher:       NewMatcherEngine(logger.NoLogger),
+		matcherExpr:   securityMatcherSimple,
+		requestTokens: []string{"sub", "obj", "act"},
+	}
+	e.mu = sync.RWMutex{}
+	e.initCachedFields()
+
+	// 正常请求应成功
+	ok, err := e.doEnforce(context.Background(), "alice", "data1", "read")
+	assert.NoError(t, err)
+	// 无策略匹配，返回 false
+	assert.False(t, ok)
+}
+
+// ==================== getPolicyAssertion 无 p 段回退测试 ====================
+
+func TestGetPolicyAssertion_NoPKey(t *testing.T) {
+	m := model.NewModel(logger.NoLogger)
+	_ = m.AddDef("r", "sub, obj, act")
+	// 只添加 SectionPolicyDefinition key，不添加 "p"
+	_ = m.AddDef(model.SectionPolicyDefinition, "sub, obj, act")
+
+	e := &Enforcer{
+		model:  m,
+		logger: logger.NoLogger,
+	}
+
+	assertion := e.getPolicyAssertion()
+	// 回退查找应能找到 SectionPolicyDefinition 段
+	assert.NotNil(t, assertion)
+}
+
+func TestGetPolicyAssertion_Nil(t *testing.T) {
+	m := model.NewModel(logger.NoLogger)
+	_ = m.AddDef("r", "sub, obj, act")
+	// 不添加任何 p 段
+
+	e := &Enforcer{
+		model:  m,
+		logger: logger.NoLogger,
+	}
+
+	assertion := e.getPolicyAssertion()
+	assert.Nil(t, assertion)
+}
+
+// ==================== evaluateEffect p.eft 字段测试 ====================
+
+func TestEvaluateEffect_WithEftField(t *testing.T) {
+	m := model.NewModel(logger.NoLogger)
+	_ = m.AddDef("r", "sub, obj, act")
+	_ = m.AddDef("p", "sub, obj, act, eft")
+	_ = m.AddDef("e", "some(where (p.eft == allow))")
+	_ = m.AddDef("m", securityMatcherSimple)
+
+	e := &Enforcer{
+		model:   m,
+		logger:  logger.NoLogger,
+		matcher: NewMatcherEngine(logger.NoLogger),
+	}
+	e.mu = sync.RWMutex{}
+
+	// 手动添加含 eft 字段的策略
+	assertion := m.GetAssertions()["p"]
+	assertion.Policies = [][]string{
+		{"alice", "data1", "read", "allow"},
+		{"bob", "data2", "write", "deny"},
+	}
+
+	result, err := e.evaluateEffect()
+	assert.NoError(t, err)
+	// some(where(p.eft==allow)) 模式下，有 allow 即通过
+	assert.True(t, bool(result))
+}
+
+func TestEvaluateEffect_NoPolicies(t *testing.T) {
+	m := model.NewModel(logger.NoLogger)
+	_ = m.AddDef("r", "sub, obj, act")
+	_ = m.AddDef("p", "sub, obj, act")
+	_ = m.AddDef("e", "some(where (p.eft == allow))")
+	_ = m.AddDef("m", securityMatcherSimple)
+
+	e := &Enforcer{
+		model:   m,
+		logger:  logger.NoLogger,
+		matcher: NewMatcherEngine(logger.NoLogger),
+	}
+	e.mu = sync.RWMutex{}
+
+	// 无策略
+	result, err := e.evaluateEffect()
+	assert.NoError(t, err)
+	assert.False(t, bool(result))
+}
+
+// ==================== notifyPolicyChange Publish 失败测试 ====================
+
+func TestNotifyPolicyChange_PublishError(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+
+	// 设置一个 Publish 会失败的通知器
+	notifier := &failingNotifier{}
+	e.notifier = notifier
+	e.autoNotifyWatcher = true
+
+	// Publish 失败不应 panic，只记录警告
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, "p", nil, []string{"alice", "data1", "read"})
+}
+
+func TestNotifyPolicyChange_AutoNotifyDisabled_WithNotifier(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+
+	e.notifier = &failingNotifier{}
+	e.autoNotifyWatcher = false
+	// autoNotifyWatcher 为 false 时不应调用 Publish
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, "p", nil, nil)
+}
+
+// ==================== matchWithExtraPolicies p2 段测试 ====================
+
+func TestMatchWithExtraPolicies_P2Segment(t *testing.T) {
+	me := NewMatcherEngine(logger.NoLogger)
+
+	m := model.NewModel(logger.NoLogger)
+	_ = m.AddDef("r", "sub, obj, act")
+	_ = m.AddDef("p", "sub, obj, act")
+	_ = m.AddDef("p2", "sub, obj, act")
+	_ = m.AddDef("e", "some(where (p.eft == allow))")
+	_ = m.AddDef("m", "r.sub == p.sub || r.sub == p2.sub")
+
+	pAssertion := m.GetAssertions()["p"]
+	pAssertion.Policies = [][]string{{"admin", "data1", "read"}}
+
+	p2Assertion := m.GetAssertions()["p2"]
+	p2Assertion.Policies = [][]string{{"alice", "data2", "read"}}
+
+	mc := &MatchContext{
+		Request: map[string]interface{}{
+			"r.sub": "alice", "r.obj": "data2", "r.act": "read",
+		},
+		Policies:    pAssertion.Policies,
+		RoleMgr:     nil,
+		Assertion:   pAssertion,
+		CustomFuncs: map[string]BuiltinFunc{},
+		ExtraPolicies: map[string]*PolicySegment{
+			"p2": {Policies: p2Assertion.Policies, Assertion: p2Assertion},
+		},
+		ShortCircuit: false,
+	}
+
+	matched, effects, err := me.Match(mc, "r.sub == p.sub || r.sub == p2.sub")
+	assert.NoError(t, err)
+	assert.True(t, matched)
+	assert.NotEmpty(t, effects)
+}
+
+func TestMatchWithExtraPolicies_P2LeftSide(t *testing.T) {
+	me := NewMatcherEngine(logger.NoLogger)
+
+	m := model.NewModel(logger.NoLogger)
+	_ = m.AddDef("r", "sub, obj, act")
+	_ = m.AddDef("p", "sub, obj, act")
+	_ = m.AddDef("p2", "sub, obj, act")
+	_ = m.AddDef("e", "some(where (p.eft == allow))")
+
+	pAssertion := m.GetAssertions()["p"]
+	pAssertion.Policies = [][]string{{"admin", "data1", "read"}}
+
+	p2Assertion := m.GetAssertions()["p2"]
+	p2Assertion.Policies = [][]string{{"alice", "data2", "read"}}
+
+	mc := &MatchContext{
+		Request: map[string]interface{}{
+			"r.sub": "alice", "r.obj": "data2", "r.act": "read",
+		},
+		Policies:    pAssertion.Policies,
+		RoleMgr:     nil,
+		Assertion:   pAssertion,
+		CustomFuncs: map[string]BuiltinFunc{},
+		ExtraPolicies: map[string]*PolicySegment{
+			"p2": {Policies: p2Assertion.Policies, Assertion: p2Assertion},
+		},
+		ShortCircuit: false,
+	}
+
+	// p2 在左侧
+	matched, effects, err := me.Match(mc, "r.sub == p2.sub || r.sub == p.sub")
+	assert.NoError(t, err)
+	assert.True(t, matched)
+	assert.NotEmpty(t, effects)
+}
+
+func TestMatchWithExtraPolicies_NoMatch(t *testing.T) {
+	me := NewMatcherEngine(logger.NoLogger)
+
+	m := model.NewModel(logger.NoLogger)
+	_ = m.AddDef("r", "sub, obj, act")
+	_ = m.AddDef("p", "sub, obj, act")
+	_ = m.AddDef("p2", "sub, obj, act")
+
+	pAssertion := m.GetAssertions()["p"]
+	pAssertion.Policies = [][]string{{"admin", "data1", "read"}}
+
+	p2Assertion := m.GetAssertions()["p2"]
+	p2Assertion.Policies = [][]string{{"bob", "data2", "read"}}
+
+	mc := &MatchContext{
+		Request: map[string]interface{}{
+			"r.sub": "eve", "r.obj": "data3", "r.act": "read",
+		},
+		Policies:    pAssertion.Policies,
+		RoleMgr:     nil,
+		Assertion:   pAssertion,
+		CustomFuncs: map[string]BuiltinFunc{},
+		ExtraPolicies: map[string]*PolicySegment{
+			"p2": {Policies: p2Assertion.Policies, Assertion: p2Assertion},
+		},
+		ShortCircuit: false,
+	}
+
+	matched, _, err := me.Match(mc, "r.sub == p.sub || r.sub == p2.sub")
+	assert.NoError(t, err)
+	assert.False(t, matched)
+}

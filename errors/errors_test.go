@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-03-28 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-03-28 00:00:00
+ * @LastEditTime: 2026-05-25 02:22:20
  * @FilePath: \go-casbin\errors\errors_test.go
  * @Description: 错误类型测试
  *
@@ -96,6 +96,9 @@ func TestEnforcerErrors(t *testing.T) {
 	assert.Error(t, err)
 
 	err = NewEnforcerRetryExhaustedError("3 attempts")
+	assert.Error(t, err)
+
+	err = NewEnforcerInvalidRequestError("empty sub")
 	assert.Error(t, err)
 }
 
