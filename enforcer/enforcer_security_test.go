@@ -27,6 +27,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// 测试用 matcher 表达式常量
+const (
+	securityMatcherSimple = "r.sub == p.sub"
+	securityMatcherACL    = "r.sub == p.sub && r.obj == p.obj && r.act == p.act"
+)
+
 // ==================== 请求参数安全校验测试 ====================
 
 func buildSecurityTestEnforcer(t *testing.T) *Enforcer {
@@ -224,7 +230,7 @@ func TestEvaluateEffectFromResults_NoEffectSection(t *testing.T) {
 	m := model.NewModel(logger.NoLogger)
 	_ = m.AddDef("r", "sub, obj, act")
 	_ = m.AddDef("p", "sub, obj, act")
-	_ = m.AddDef("m", "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
+	_ = m.AddDef("m", securityMatcherACL)
 
 	e := &Enforcer{
 		model:  m,
@@ -252,7 +258,7 @@ func TestEvaluateEffect_NoPolicyAssertion(t *testing.T) {
 	_ = m.AddDef("r", "sub, obj, act")
 	_ = m.AddDef("p", "sub, obj, act")
 	_ = m.AddDef("e", "some(where (p.eft == allow))")
-	_ = m.AddDef("m", "r.sub == p.sub")
+	_ = m.AddDef("m", securityMatcherSimple)
 
 	e := &Enforcer{
 		model:  m,
@@ -449,7 +455,7 @@ func TestComputeShortCircuit(t *testing.T) {
 			_ = m.AddDef("r", "sub, obj, act")
 			_ = m.AddDef("p", "sub, obj, act")
 			_ = m.AddDef("e", tt.effectExpr)
-			_ = m.AddDef("m", "r.sub == p.sub")
+			_ = m.AddDef("m", securityMatcherSimple)
 
 			evaluator := policy.NewEffectEvaluator(tt.effectExpr)
 
@@ -665,12 +671,12 @@ func TestDoEnforce_NoPolicyAssertion(t *testing.T) {
 	m := model.NewModel(logger.NoLogger)
 	_ = m.AddDef("r", "sub, obj, act")
 	// 不添加 p 段
-	_ = m.AddDef("m", "r.sub == p.sub")
+	_ = m.AddDef("m", securityMatcherSimple)
 
 	e := &Enforcer{
 		model:       m,
 		logger:      logger.NoLogger,
-		matcherExpr: "r.sub == p.sub",
+		matcherExpr: securityMatcherSimple,
 	}
 	e.mu = sync.RWMutex{}
 
@@ -682,12 +688,12 @@ func TestDoEnforce_NilRequest(t *testing.T) {
 	m := model.NewModel(logger.NoLogger)
 	_ = m.AddDef("r", "sub, obj, act")
 	_ = m.AddDef("p", "sub, obj, act")
-	_ = m.AddDef("m", "r.sub == p.sub")
+	_ = m.AddDef("m", securityMatcherSimple)
 
 	e := &Enforcer{
 		model:         m,
 		logger:        logger.NoLogger,
-		matcherExpr:   "r.sub == p.sub",
+		matcherExpr:   securityMatcherSimple,
 		requestTokens: nil, // 导致 buildRequest 返回 nil
 	}
 	e.mu = sync.RWMutex{}
@@ -820,4 +826,136 @@ func TestLoadFilteredPolicy_Error(t *testing.T) {
 
 	err := e.LoadFilteredPolicy(nil)
 	assert.Error(t, err)
+}
+
+// ==================== NewEnforcer 错误路径测试 ====================
+
+func TestNewEnforcer_NoModelSource(t *testing.T) {
+	_, err := NewEnforcer()
+	assert.Error(t, err)
+}
+
+func TestNewEnforcer_InvalidModelPath(t *testing.T) {
+	_, err := NewEnforcer(WithModelPath("nonexistent_model.conf"))
+	assert.Error(t, err)
+}
+
+func TestNewEnforcer_InvalidModelText(t *testing.T) {
+	_, err := NewEnforcer(WithModelText("invalid model text"))
+	assert.Error(t, err)
+}
+
+func TestNewEnforcer_WithModelText(t *testing.T) {
+	modelText := `[request_definition]
+r = sub, obj, act
+
+[policy_definition]
+p = sub, obj, act
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = r.sub == p.sub && r.obj == p.obj && r.act == p.act`
+
+	e, err := NewEnforcer(WithModelText(modelText), WithLogger(logger.NoLogger))
+	require.NoError(t, err)
+	defer e.Close()
+
+	assert.Equal(t, StateReady, e.GetState())
+}
+
+func TestNewEnforcer_PolicyLoadFailed(t *testing.T) {
+	modelText := `[request_definition]
+r = sub, obj, act
+
+[policy_definition]
+p = sub, obj, act
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = r.sub == p.sub && r.obj == p.obj && r.act == p.act`
+
+	_, err := NewEnforcer(
+		WithModelText(modelText),
+		WithAdapter(&failingAdapter{}),
+		WithLogger(logger.NoLogger),
+	)
+	assert.Error(t, err)
+}
+
+// ==================== executeWithBreaker 熔断器打开测试 ====================
+
+func TestExecuteWithBreaker_OpenState(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+
+	// 创建一个快速打开的熔断器
+	b := breaker.New("test-open", breaker.Config{MaxFailures: 1, ResetTimeout: time.Hour})
+	e.breaker = b
+
+	// 先让熔断器打开：触发一次失败
+	_ = b.Execute(func() error {
+		return fmt.Errorf("forced failure")
+	})
+
+	// 现在熔断器应该打开
+	result, err := e.executeWithBreaker(func() (bool, error) {
+		return true, nil
+	})
+	assert.Error(t, err)
+	assert.False(t, result)
+}
+
+// ==================== handlePolicyChange ReloadPolicy 失败测试 ====================
+
+func TestHandlePolicyChange_ReloadFailed(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+
+	// 替换适配器为会失败的适配器
+	e.policy.SetAdapter(&failingAdapter{})
+
+	event := policy.NewChangeEvent(policy.EventTypePolicyAdded, "p", "test-node")
+	event.NewPolicy = []string{"alice", "data3", "read"}
+
+	// ReloadPolicy 失败，应记录错误但不 panic
+	e.handlePolicyChange(event)
+}
+
+// ==================== SetNotifier 重复测试已移除 ====================
+
+// ==================== notifyPolicyChange 测试已存在于上方 ====================
+
+// ==================== ReloadPolicy 错误路径测试 ====================
+
+func TestReloadPolicy_Error(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+
+	// 替换适配器为会失败的适配器
+	e.policy.SetAdapter(&failingAdapter{})
+
+	err := e.ReloadPolicy()
+	assert.Error(t, err)
+}
+
+// ==================== evaluateEffect 边界测试 ====================
+
+func TestEvaluateEffect_DenyOnly(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+
+	// evaluateEffectFromResults 只有 deny 效果
+	result, err := e.evaluateEffectFromResults([]string{"deny"})
+	assert.NoError(t, err)
+	assert.False(t, bool(result))
+}
+
+func TestEvaluateEffect_MixedAllowDeny(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+
+	// 混合 allow 和 deny
+	result, err := e.evaluateEffectFromResults([]string{"allow", "deny"})
+	assert.NoError(t, err)
+	// some(where(p.eft==allow)) 模式下，有 allow 即通过
+	assert.True(t, bool(result))
 }

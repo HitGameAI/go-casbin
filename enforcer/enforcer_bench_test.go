@@ -20,6 +20,9 @@ import (
 	"github.com/kamalyes/go-logger"
 )
 
+// 测试用 matcher 表达式常量
+const benchMatcherACL = "r.sub == p.sub && r.obj == p.obj && r.act == p.act"
+
 // ==================== 正则缓存基准测试 ====================
 
 // BenchmarkRegexMatch_Cached 测试 RegexMatch 在缓存命中时的性能
@@ -245,7 +248,7 @@ func BenchmarkMatcherEngine_Match_ACL(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		me.Match(mc, "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
+		me.Match(mc, benchMatcherACL)
 	}
 }
 
@@ -269,6 +272,6 @@ func BenchmarkMatcherEngine_Match_ShortCircuit(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		me.Match(mc, "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
+		me.Match(mc, benchMatcherACL)
 	}
 }

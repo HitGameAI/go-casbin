@@ -16,6 +16,11 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// 测试用 matcher 表达式常量
+const (
+	controlMatcherACLShort = "r.sub == p.sub && r.obj == p.obj"
+)
+
 func TestEnforcerEnable(t *testing.T) {
 	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
 
@@ -273,4 +278,127 @@ func TestHasNamedGroupingPolicy(t *testing.T) {
 
 	assert.True(t, e.HasNamedGroupingPolicy("g", "alice", "admin"))
 	assert.False(t, e.HasNamedGroupingPolicy("g", "nobody", "admin"))
+}
+
+// ==================== EnforceWithMatcher / BatchEnforceWithMatcher 测试 ====================
+
+func TestEnforceWithMatcher(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	// 使用自定义 matcher 表达式
+	ok, err := e.EnforceWithMatcher(controlMatcherACLShort, "alice", "data1", "read")
+	assert.NoError(t, err)
+	assert.True(t, ok)
+
+	// 不匹配
+	ok, err = e.EnforceWithMatcher(controlMatcherACLShort, "bob", "data1", "read")
+	assert.NoError(t, err)
+	assert.False(t, ok)
+}
+
+func TestEnforceWithMatcher_EmptyExpr(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	// 空 matcher 表达式应回退到默认
+	ok, err := e.EnforceWithMatcher("", "alice", "data1", "read")
+	assert.NoError(t, err)
+	assert.True(t, ok)
+}
+
+func TestBatchEnforceWithMatcher(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	requests := [][]interface{}{
+		{"alice", "data1", "read"},
+		{"bob", "data2", "write"},
+		{"eve", "data3", "read"},
+	}
+
+	results, err := e.BatchEnforceWithMatcher(controlMatcherACLShort, requests)
+	assert.NoError(t, err)
+	assert.Equal(t, 3, len(results))
+	assert.True(t, results[0])  // alice 可以读 data1
+	assert.True(t, results[1])  // bob 可以写 data2
+	assert.False(t, results[2]) // eve 无权限
+}
+
+// ==================== EnforceEx / EnforceExWithMatcher 测试 ====================
+
+func TestEnforceEx(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	ok, policy, err := e.EnforceEx("alice", "data1", "read")
+	assert.NoError(t, err)
+	assert.True(t, ok)
+	assert.NotNil(t, policy)
+}
+
+func TestEnforceEx_Deny(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	ok, policy, err := e.EnforceEx("eve", "data1", "read")
+	assert.NoError(t, err)
+	assert.False(t, ok)
+	assert.Nil(t, policy)
+}
+
+func TestEnforceExWithMatcher(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	ok, policy, err := e.EnforceExWithMatcher(controlMatcherACLShort, "alice", "data1", "read")
+	assert.NoError(t, err)
+	assert.True(t, ok)
+	assert.NotNil(t, policy)
+}
+
+// ==================== BatchEnforce 测试 ====================
+
+func TestBatchEnforce(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	requests := [][]interface{}{
+		{"alice", "data1", "read"},
+		{"bob", "data2", "write"},
+		{"eve", "data3", "read"},
+	}
+
+	results, err := e.BatchEnforce(requests)
+	assert.NoError(t, err)
+	assert.Equal(t, 3, len(results))
+	assert.True(t, results[0])
+	assert.False(t, results[1]) // bob 没有 data2 write 权限
+	assert.False(t, results[2])
+}
+
+func TestBatchEnforce_Error(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// 参数数量不匹配
+	requests := [][]interface{}{
+		{"alice"},
+	}
+
+	results, err := e.BatchEnforce(requests)
+	assert.Error(t, err)
+	assert.Nil(t, results)
+}
+
+// ==================== doEnforceWithMatcher 内部测试 ====================
+
+func TestDoEnforceWithMatcher_InvalidRequest(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// 参数为空
+	ok, err := e.EnforceWithMatcher("r.sub == p.sub")
+	assert.Error(t, err)
+	assert.False(t, ok)
 }

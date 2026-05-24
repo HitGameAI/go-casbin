@@ -19,6 +19,14 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// 测试用 matcher 表达式常量
+const (
+	matcherACL      = "r.sub == p.sub && r.obj == p.obj && r.act == p.act"
+	matcherACLShort = "r.sub == p.sub && r.obj == p.obj"
+	matcherSimple   = "r.sub == p.sub"
+	matcherEval     = "eval(p.sub_rule)"
+)
+
 func newTestMatcherEngine() *MatcherEngine {
 	return NewMatcherEngine(logger.NewLogger())
 }
@@ -68,7 +76,7 @@ func TestMatcherEngine_Match_BasicACL(t *testing.T) {
 		CustomFuncs: map[string]BuiltinFunc{},
 	}
 
-	ok, effects, err := me.Match(mc, "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
+	ok, effects, err := me.Match(mc, matcherACL)
 	assert.NoError(t, err)
 	assert.True(t, ok)
 	assert.Contains(t, effects, "allow")
@@ -92,7 +100,7 @@ func TestMatcherEngine_Match_NoMatch(t *testing.T) {
 		CustomFuncs: map[string]BuiltinFunc{},
 	}
 
-	ok, effects, err := me.Match(mc, "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
+	ok, effects, err := me.Match(mc, matcherACL)
 	assert.NoError(t, err)
 	assert.False(t, ok)
 	assert.Nil(t, effects)
@@ -195,7 +203,7 @@ func TestMatcherEngine_Match_ShortCircuit(t *testing.T) {
 		ShortCircuit: true,
 	}
 
-	ok, effects, err := me.Match(mc, "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
+	ok, effects, err := me.Match(mc, matcherACL)
 	assert.NoError(t, err)
 	assert.True(t, ok)
 	// 短路优化：匹配到第一条 allow 后立即返回，不应包含 deny
@@ -223,7 +231,7 @@ func TestMatcherEngine_Match_NoShortCircuit(t *testing.T) {
 		ShortCircuit: false,
 	}
 
-	ok, effects, err := me.Match(mc, "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
+	ok, effects, err := me.Match(mc, matcherACL)
 	assert.NoError(t, err)
 	assert.True(t, ok)
 	// 无短路：应匹配所有策略
@@ -464,7 +472,7 @@ func TestMatcherEngine_ParseFunctionCall(t *testing.T) {
 	assert.False(t, ok)
 
 	// eval 函数不应被解析
-	_, _, ok = me.parseFunctionCall("eval(p.sub_rule)")
+	_, _, ok = me.parseFunctionCall(matcherEval)
 	assert.False(t, ok)
 
 	// 非函数表达式
@@ -584,7 +592,7 @@ func TestExpandEval_DangerousExpression(t *testing.T) {
 		"p.sub_rule": `os.Getenv("SECRET")`,
 	}
 
-	result := me.expandEval("eval(p.sub_rule)", vars)
+	result := me.expandEval(matcherEval, vars)
 	assert.Equal(t, "false", result, "dangerous eval expression should be blocked")
 }
 
@@ -650,7 +658,7 @@ func TestSetModel(t *testing.T) {
 	_ = newModel.AddDef("r", "sub, obj, act")
 	_ = newModel.AddDef("p", "sub, obj, act")
 	_ = newModel.AddDef("e", "some(where (p.eft == allow))")
-	_ = newModel.AddDef("m", "r.sub == p.sub && r.obj == p.obj && r.act == p.act")
+	_ = newModel.AddDef("m", matcherACL)
 
 	e.SetModel(newModel)
 	assert.Equal(t, newModel, e.GetModel())
@@ -662,7 +670,7 @@ func TestExpandEval_SafeExpression(t *testing.T) {
 		"p.sub_rule": `r.sub == "admin"`,
 	}
 
-	result := me.expandEval("eval(p.sub_rule)", vars)
+	result := me.expandEval(matcherEval, vars)
 	assert.Equal(t, `r.sub == "admin"`, result)
 }
 
@@ -710,7 +718,7 @@ func TestMatchSingleSegment_WithPolicies(t *testing.T) {
 		ShortCircuit: true,
 	}
 
-	ok, effects, err := me.matchSingleSegment(mc, "r.sub == p.sub && r.obj == p.obj", mc.Policies, assertion, nil)
+	ok, effects, err := me.matchSingleSegment(mc, matcherACLShort, mc.Policies, assertion, nil)
 	assert.NoError(t, err)
 	assert.True(t, ok)
 	assert.Contains(t, effects, "allow")
@@ -734,7 +742,7 @@ func TestMatchSingleSegment_ShortCircuit(t *testing.T) {
 		ShortCircuit: true,
 	}
 
-	ok, effects, err := me.matchSingleSegment(mc, "r.sub == p.sub && r.obj == p.obj", mc.Policies, assertion, nil)
+	ok, effects, err := me.matchSingleSegment(mc, matcherACLShort, mc.Policies, assertion, nil)
 	assert.NoError(t, err)
 	assert.True(t, ok)
 	assert.Len(t, effects, 1, "short circuit should stop at first allow")
