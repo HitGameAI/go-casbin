@@ -1570,6 +1570,11 @@ func (e *Enforcer) HasNamedPolicy(ptype string, params ...string) bool {
 	return e.policy.HasPolicy(ptype, params)
 }
 
+// HasPolicy 判断 p 段中是否存在某条策略
+func (e *Enforcer) HasPolicy(params ...string) bool {
+	return e.policy.HasPolicy("p", params)
+}
+
 // HasGroupingPolicy 判断 g 段中是否存在某条分组策略
 func (e *Enforcer) HasGroupingPolicy(params ...string) bool {
 	return e.policy.HasPolicy("g", params)

@@ -73,3 +73,17 @@ func TestAssertion_BuildRoleLinkCondition(t *testing.T) {
 	result := a.BuildRoleLinkCondition("alice", "admin")
 	assert.Equal(t, "alice:admin", result)
 }
+
+func TestAssertion_RebuildPolicyMap(t *testing.T) {
+	a := NewAssertion("p", "sub, obj, act")
+	a.AddPolicy([]string{"alice", "data1", "read"})
+	a.AddPolicy([]string{"bob", "data2", "write"})
+
+	// 手动修改 Policies 后重建索引
+	a.Policies = append(a.Policies, []string{"eve", "data3", "write"})
+	a.rebuildPolicyMap()
+
+	assert.Equal(t, 0, a.PolicyMap["alice,data1,read"])
+	assert.Equal(t, 1, a.PolicyMap["bob,data2,write"])
+	assert.Equal(t, 2, a.PolicyMap["eve,data3,write"])
+}

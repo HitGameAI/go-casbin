@@ -57,6 +57,12 @@ func TestSortArray2D_Empty(t *testing.T) {
 	assert.Empty(t, arr)
 }
 
+func TestSortArray2D_DifferentLengths(t *testing.T) {
+	arr := [][]string{{"a", "b", "c"}, {"a", "b"}, {"a"}}
+	SortArray2D(arr)
+	assert.Equal(t, [][]string{{"a"}, {"a", "b"}, {"a", "b", "c"}}, arr)
+}
+
 // ==================== 去重测试 ====================
 
 func TestArrayRemoveDuplicates(t *testing.T) {

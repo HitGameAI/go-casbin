@@ -43,6 +43,28 @@ m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
 	return NewPolicy(m, NewMemoryAdapter(), logger.NewLogger())
 }
 
+func newTestPolicyWithAdapter(t *testing.T, adapter Adapter) *Policy {
+	t.Helper()
+	m, err := model.NewModelFromText(`
+[request_definition]
+r = sub, obj, act
+
+[policy_definition]
+p = sub, obj, act
+
+[role_definition]
+g = _, _
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
+`, logger.NewLogger())
+	require.NoError(t, err)
+	return NewPolicy(m, adapter, logger.NewLogger())
+}
+
 // ==================== Policy CRUD 测试 ====================
 
 func TestPolicy_LoadPolicy(t *testing.T) {
@@ -1004,6 +1026,16 @@ m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
 	assert.Error(t, err)
 	// 回滚后策略应恢复
 	assert.True(t, p.HasPolicy("p", []string{"alice", "data1", "read"}))
+}
+
+func TestPolicy_SetAutoSave(t *testing.T) {
+	p := newTestPolicy(t)
+
+	p.SetAutoSave(false)
+	assert.False(t, p.IsAutoSave())
+
+	p.SetAutoSave(true)
+	assert.True(t, p.IsAutoSave())
 }
 
 // removeFailAdapter 只实现 Adapter，RemovePolicy 会失败

@@ -72,3 +72,18 @@ func TestNewModelFromPath_NotFound(t *testing.T) {
 	_, err := NewModelFromPath("/nonexistent/model.conf", newTestLogger())
 	assert.Error(t, err)
 }
+
+func TestLoadModelFromFile_StatError(t *testing.T) {
+	// 使用已关闭的文件触发 Stat 错误
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "model.conf")
+	err := os.WriteFile(path, []byte(testModelText), 0644)
+	require.NoError(t, err)
+
+	file, err := os.Open(path)
+	require.NoError(t, err)
+	file.Close()
+
+	_, err = LoadModelFromFile(file)
+	assert.Error(t, err)
+}

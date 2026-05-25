@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-03-28 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-03-28 00:00:00
+ * @LastEditTime: 2026-05-25 09:58:50
  * @FilePath: \go-casbin\policy\effect_test.go
  * @Description: 策略效果评估器测试
  *
@@ -69,4 +69,19 @@ func TestEffectEvaluator_Default_NoMatch(t *testing.T) {
 func TestEffectEvaluator_GetExpression(t *testing.T) {
 	ee := NewEffectEvaluator("some(where (p.eft == allow))")
 	assert.Equal(t, "some(where (p.eft == allow))", ee.GetExpression())
+}
+
+// evaluateSomeWhereP 使用 p_eft 格式表达式的测试
+func TestEffectEvaluator_SomeWhereP_Allow(t *testing.T) {
+	ee := NewEffectEvaluator("some(where (p_eft == allow))")
+	result, err := ee.evaluateSomeWhereP([]string{"allow"}, ee.effectExpr)
+	assert.NoError(t, err)
+	assert.Equal(t, EffectAllowResult, result)
+}
+
+func TestEffectEvaluator_SomeWhereP_Deny(t *testing.T) {
+	ee := NewEffectEvaluator("some(where (p_eft == allow))")
+	result, err := ee.evaluateSomeWhereP([]string{"deny"}, ee.effectExpr)
+	assert.NoError(t, err)
+	assert.Equal(t, EffectDenyResult, result)
 }

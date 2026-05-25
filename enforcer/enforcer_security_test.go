@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2026-05-23 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2026-05-23 23:21:23
+ * @LastEditTime: 2026-05-25 03:12:00
  * @FilePath: \go-casbin\enforcer\enforcer_security_test.go
  * @Description: 测试执行器安全校验
  *
@@ -23,6 +23,8 @@ import (
 	"github.com/kamalyes/go-casbin/role"
 	"github.com/kamalyes/go-logger"
 	"github.com/kamalyes/go-toolbox/pkg/breaker"
+	"github.com/kamalyes/go-toolbox/pkg/retry"
+	"github.com/kamalyes/go-toolbox/pkg/syncx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1225,4 +1227,183 @@ func TestMatchWithExtraPolicies_NoMatch(t *testing.T) {
 	matched, _, err := me.Match(mc, "r.sub == p.sub || r.sub == p2.sub")
 	assert.NoError(t, err)
 	assert.False(t, matched)
+}
+
+// ==================== doEnforceWithMatcher 边界测试 ====================
+
+func TestDoEnforceWithMatcher_RequestNil(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+
+	// 参数数量不匹配模型定义，buildRequest 返回 nil
+	_, err := e.EnforceWithMatcher(securityMatcherACL, "alice")
+	assert.Error(t, err)
+}
+
+func TestDoEnforceWithMatcher_MatcherError(t *testing.T) {
+	// 危险表达式通过 eval 展开时会被拦截，返回 false 而非 error
+	// containsDangerousExpr 仅在 expandEval 中调用
+	m := model.NewModel(logger.NoLogger)
+	_ = m.AddDef("r", "sub, obj, act")
+	_ = m.AddDef("p", "sub, sub_rule, obj, act")
+	_ = m.AddDef("e", "some(where (p.eft == allow))")
+	_ = m.AddDef("m", "eval(p.sub_rule) && r.obj == p.obj && r.act == p.act")
+
+	e2 := &Enforcer{
+		model:         m,
+		logger:        logger.NoLogger,
+		matcher:       NewMatcherEngine(logger.NoLogger),
+		matcherExpr:   "eval(p.sub_rule) && r.obj == p.obj && r.act == p.act",
+		enabled:       true,
+		shortCircuit:  true,
+		requestTokens: []string{"r.sub", "r.obj", "r.act"},
+	}
+	e2.mu = sync.RWMutex{}
+	sm := syncx.NewStateMachine[string](StateDisabled)
+	sm.AllowTransition(StateDisabled, StateReady)
+	_ = sm.TransitionTo(StateReady)
+	e2.stateMachine = sm
+
+	assertion := m.GetAssertions()["p"]
+	assertion.Policies = [][]string{
+		{"alice", "os.Getenv('SECRET') == 'admin'", "data1", "read"},
+	}
+
+	// 危险 eval 值被拦截后表达式变为 false，匹配不通过
+	ok, err := e2.EnforceWithMatcher("", "alice", "data1", "read")
+	assert.NoError(t, err)
+	assert.False(t, ok)
+}
+
+func TestDoEnforceWithMatcher_NoMatch(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+
+	ok, err := e.EnforceWithMatcher(securityMatcherACL, "eve", "data1", "read")
+	assert.NoError(t, err)
+	assert.False(t, ok)
+}
+
+func TestDoEnforceWithMatcher_EmptyMatcherExpr_BothEmpty(t *testing.T) {
+	m := model.NewModel(logger.NoLogger)
+	_ = m.AddDef("r", "sub, obj, act")
+	_ = m.AddDef("p", "sub, obj, act")
+	_ = m.AddDef("e", "some(where (p.eft == allow))")
+
+	e := &Enforcer{
+		model:         m,
+		logger:        logger.NoLogger,
+		matcher:       NewMatcherEngine(logger.NoLogger),
+		enabled:       true,
+		requestTokens: []string{"r.sub", "r.obj", "r.act"},
+	}
+	e.mu = sync.RWMutex{}
+	sm := syncx.NewStateMachine[string](StateDisabled)
+	sm.AllowTransition(StateDisabled, StateReady)
+	_ = sm.TransitionTo(StateReady)
+	e.stateMachine = sm
+
+	_, err := e.EnforceWithMatcher("", "alice", "data1", "read")
+	assert.Error(t, err)
+}
+
+func TestDoEnforceWithMatcher_NoPolicyAssertion(t *testing.T) {
+	m := model.NewModel(logger.NoLogger)
+	_ = m.AddDef("r", "sub, obj, act")
+	_ = m.AddDef("e", "some(where (p.eft == allow))")
+	_ = m.AddDef("m", securityMatcherSimple)
+
+	e := &Enforcer{
+		model:         m,
+		logger:        logger.NoLogger,
+		matcher:       NewMatcherEngine(logger.NoLogger),
+		matcherExpr:   securityMatcherSimple,
+		enabled:       true,
+		requestTokens: []string{"r.sub", "r.obj", "r.act"},
+	}
+	e.mu = sync.RWMutex{}
+	sm := syncx.NewStateMachine[string](StateDisabled)
+	sm.AllowTransition(StateDisabled, StateReady)
+	_ = sm.TransitionTo(StateReady)
+	e.stateMachine = sm
+
+	_, err := e.EnforceWithMatcher("", "alice", "data1", "read")
+	assert.Error(t, err)
+}
+
+func TestEnforceExWithMatcher_Deny(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+
+	ok, policy, err := e.EnforceExWithMatcher(securityMatcherACL, "eve", "data1", "read")
+	assert.NoError(t, err)
+	assert.False(t, ok)
+	assert.Nil(t, policy)
+}
+
+func TestEnforceExWithMatcher_EmptyExpr(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+
+	ok, policy, err := e.EnforceExWithMatcher("", "alice", "data1", "read")
+	assert.NoError(t, err)
+	assert.True(t, ok)
+	assert.NotNil(t, policy)
+}
+
+func TestEnforceEx_Disabled(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	e.Enable(false)
+
+	ok, policy, err := e.EnforceEx("alice", "data1", "read")
+	assert.Error(t, err)
+	assert.False(t, ok)
+	assert.Nil(t, policy)
+}
+
+// ==================== NewEnforcer 边界测试 ====================
+
+func TestNewEnforcer_WithRetry(t *testing.T) {
+	r := retry.NewRetry().SetAttemptCount(3)
+	e, err := NewEnforcer(
+		WithModelPath(aclModelPath),
+		WithPolicyPath(aclPolicyPath),
+		WithLogger(logger.NoLogger),
+		WithRetry(r),
+	)
+	require.NoError(t, err)
+	defer e.Close()
+	assert.Equal(t, StateReady, e.GetState())
+}
+
+func TestNewEnforcer_WithWatcher(t *testing.T) {
+	e, err := NewEnforcer(
+		WithModelPath(aclModelPath),
+		WithPolicyPath(aclPolicyPath),
+		WithLogger(logger.NoLogger),
+		WithWatcher(true, 5*time.Second),
+	)
+	require.NoError(t, err)
+	defer e.Close()
+	assert.Equal(t, StateReady, e.GetState())
+}
+
+func TestNewEnforcer_Disabled(t *testing.T) {
+	e, err := NewEnforcer(
+		WithModelPath(aclModelPath),
+		WithPolicyPath(aclPolicyPath),
+		WithLogger(logger.NoLogger),
+		WithEnabled(false),
+	)
+	require.NoError(t, err)
+	defer e.Close()
+	assert.False(t, e.IsEnabled())
+}
+
+func TestNewEnforcer_WithBreaker(t *testing.T) {
+	e, err := NewEnforcer(
+		WithModelPath(aclModelPath),
+		WithPolicyPath(aclPolicyPath),
+		WithLogger(logger.NoLogger),
+		WithBreaker("test", breaker.Config{MaxFailures: 5, ResetTimeout: time.Second}),
+	)
+	require.NoError(t, err)
+	defer e.Close()
+	assert.Equal(t, StateReady, e.GetState())
 }

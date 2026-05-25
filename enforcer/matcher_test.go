@@ -11,6 +11,7 @@
 package enforcer
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/kamalyes/go-casbin/model"
@@ -781,4 +782,168 @@ func TestEvaluateRoleFunctionWithDomain_NilRoleMgr(t *testing.T) {
 
 	assert.True(t, me.evaluateRoleFunctionWithDomain("alice", "alice", "tenant1", nil))
 	assert.False(t, me.evaluateRoleFunctionWithDomain("alice", "bob", "tenant1", nil))
+}
+
+// ==================== evalExpr 补充测试 ====================
+
+func TestEvalExpr_EmptyExpr(t *testing.T) {
+	me := newTestMatcherEngine()
+	assert.False(t, me.evalExpr("", nil, nil))
+}
+
+func TestEvalExpr_NestedParentheses(t *testing.T) {
+	me := newTestMatcherEngine()
+	vars := map[string]interface{}{"r.sub": "alice", "p.sub": "alice"}
+	// 多层括号嵌套
+	assert.True(t, me.evalExpr("(((r.sub == p.sub)))", vars, nil))
+}
+
+func TestEvalExpr_OrAndMixed(t *testing.T) {
+	me := newTestMatcherEngine()
+	vars := map[string]interface{}{"r.sub": "alice", "p.sub": "alice", "r.obj": "data1", "p.obj": "data2"}
+	// || 和 && 混合：r.sub == p.sub 为 true，短路返回 true
+	assert.True(t, me.evalExpr("r.sub == p.sub || r.obj == p.obj", vars, nil))
+}
+
+func TestEvalExpr_AndTrue(t *testing.T) {
+	me := newTestMatcherEngine()
+	vars := map[string]interface{}{"r.sub": "alice", "p.sub": "alice", "r.obj": "data1", "p.obj": "data1"}
+	assert.True(t, me.evalExpr("r.sub == p.sub && r.obj == p.obj", vars, nil))
+}
+
+func TestEvalExpr_AndFalse(t *testing.T) {
+	me := newTestMatcherEngine()
+	vars := map[string]interface{}{"r.sub": "alice", "p.sub": "alice", "r.obj": "data1", "p.obj": "data2"}
+	assert.False(t, me.evalExpr("r.sub == p.sub && r.obj == p.obj", vars, nil))
+}
+
+func TestEvalExpr_NotEqual(t *testing.T) {
+	me := newTestMatcherEngine()
+	vars := map[string]interface{}{"r.sub": "alice", "p.sub": "bob"}
+	assert.True(t, me.evalExpr("r.sub != p.sub", vars, nil))
+	assert.False(t, me.evalExpr("r.sub != r.sub", vars, nil))
+}
+
+func TestEvalExpr_CustomFuncError(t *testing.T) {
+	me := newTestMatcherEngine()
+	me.customFuncs = map[string]BuiltinFunc{
+		"failFunc": func(args ...interface{}) (interface{}, error) {
+			return nil, fmt.Errorf("custom error")
+		},
+	}
+	vars := map[string]interface{}{"r.sub": "alice", "p.sub": "bob"}
+	// 自定义函数返回 error，应返回 false
+	assert.False(t, me.evalExpr("failFunc(r.sub, p.sub)", vars, nil))
+}
+
+func TestEvalExpr_CustomFuncNonBoolReturn(t *testing.T) {
+	me := newTestMatcherEngine()
+	me.customFuncs = map[string]BuiltinFunc{
+		"intFunc": func(args ...interface{}) (interface{}, error) {
+			return 42, nil // 非 bool 返回
+		},
+	}
+	vars := map[string]interface{}{"r.sub": "alice"}
+	assert.False(t, me.evalExpr("intFunc(r.sub)", vars, nil))
+}
+
+func TestEvalExpr_InExpr(t *testing.T) {
+	me := newTestMatcherEngine()
+	vars := map[string]interface{}{"r.sub": "alice"}
+	assert.True(t, me.evalExpr(`r.sub in ("alice","bob")`, vars, nil))
+	assert.False(t, me.evalExpr(`r.sub in ("charlie","bob")`, vars, nil))
+}
+
+func TestEvalExpr_Fallback(t *testing.T) {
+	me := newTestMatcherEngine()
+	// 无法解析的表达式，返回 false
+	assert.False(t, me.evalExpr("unknown_expr", nil, nil))
+}
+
+// ==================== parseFunctionCall 补充测试 ====================
+
+func TestParseFunctionCall_NoLeftParen(t *testing.T) {
+	me := newTestMatcherEngine()
+	_, _, ok := me.parseFunctionCall("noParens")
+	assert.False(t, ok)
+}
+
+func TestParseFunctionCall_NoRightParenAtEnd(t *testing.T) {
+	me := newTestMatcherEngine()
+	_, _, ok := me.parseFunctionCall("func(a, b")
+	assert.False(t, ok)
+}
+
+func TestParseFunctionCall_EmptyName(t *testing.T) {
+	me := newTestMatcherEngine()
+	_, _, ok := me.parseFunctionCall("(a, b)")
+	assert.False(t, ok)
+}
+
+func TestParseFunctionCall_GFunction(t *testing.T) {
+	me := newTestMatcherEngine()
+	_, _, ok := me.parseFunctionCall("g(r.sub, p.sub)")
+	assert.False(t, ok)
+}
+
+func TestParseFunctionCall_EvalFunction(t *testing.T) {
+	me := newTestMatcherEngine()
+	_, _, ok := me.parseFunctionCall("eval(p.sub_rule)")
+	assert.False(t, ok)
+}
+
+func TestParseFunctionCall_NestedArgs(t *testing.T) {
+	me := newTestMatcherEngine()
+	name, args, ok := me.parseFunctionCall("func(a, (b, c), d)")
+	assert.True(t, ok)
+	assert.Equal(t, "func", name)
+	assert.Len(t, args, 3)
+}
+
+func TestParseFunctionCall_NoArgs(t *testing.T) {
+	me := newTestMatcherEngine()
+	_, _, ok := me.parseFunctionCall("func()")
+	assert.False(t, ok) // 0 个参数应返回 false
+}
+
+func TestEvalInExpr_NoInKeyword(t *testing.T) {
+	me := newTestMatcherEngine()
+	vars := map[string]interface{}{"r.sub": "alice"}
+	// 不含 " in " 的表达式应返回 false
+	assert.False(t, me.evalInExpr("r.sub == \"alice\"", vars))
+}
+
+func TestEvalInExpr_NoParentheses(t *testing.T) {
+	me := newTestMatcherEngine()
+	vars := map[string]interface{}{"r.sub": "alice"}
+	// 右侧没有括号应返回 false
+	assert.False(t, me.evalInExpr("r.sub in alice,bob", vars))
+}
+
+func TestEvalGFunction_NoMatch(t *testing.T) {
+	me := newTestMatcherEngine()
+	vars := map[string]interface{}{"r.sub": "alice", "p.sub": "admin"}
+	// g() 参数不足应返回 false
+	assert.False(t, me.evalGFunction("g()", vars, nil))
+}
+
+func TestEvalGFunction_NilRoleMgr(t *testing.T) {
+	me := newTestMatcherEngine()
+	vars := map[string]interface{}{"r.sub": "alice", "p.sub": "alice"}
+	// roleMgr 为 nil 时，name1 == name2 返回 true
+	assert.True(t, me.evalGFunction("g(r.sub, p.sub)", vars, nil))
+}
+
+func TestEvalGFunction_NilRoleMgr_Different(t *testing.T) {
+	me := newTestMatcherEngine()
+	vars := map[string]interface{}{"r.sub": "alice", "p.sub": "admin"}
+	// roleMgr 为 nil 时，name1 != name2 返回 false
+	assert.False(t, me.evalGFunction("g(r.sub, p.sub)", vars, nil))
+}
+
+func TestEvalGFunction_WithDomain_NilRoleMgr(t *testing.T) {
+	me := newTestMatcherEngine()
+	vars := map[string]interface{}{"r.sub": "alice", "p.sub": "alice", "r.dom": "tenant1"}
+	// roleMgr 为 nil 时，带域的 g() 也比较 name1 == name2
+	assert.True(t, me.evalGFunction("g(r.sub, p.sub, r.dom)", vars, nil))
 }

@@ -12,8 +12,10 @@ package enforcer
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
+	"github.com/kamalyes/go-casbin/policy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -155,4 +157,72 @@ func TestDeleteRoleAssignments(t *testing.T) {
 
 	users := e.GetUsersForRole("admin")
 	assert.Empty(t, users, "admin should have no users after deleting assignments")
+}
+
+// mockTransactionalAdapter 实现 TransactionalAdapter 接口
+type mockTransactionalAdapter struct {
+	policy.Adapter
+	executed bool
+	err      error
+}
+
+func newMockTransactionalAdapter() *mockTransactionalAdapter {
+	return &mockTransactionalAdapter{
+		Adapter: policy.NewMemoryAdapter(),
+	}
+}
+
+func (m *mockTransactionalAdapter) ExecuteInTransaction(ctx context.Context, fn func(policy.Adapter) error) error {
+	m.executed = true
+	if m.err != nil {
+		return m.err
+	}
+	return fn(m.Adapter)
+}
+
+func TestExecuteInTransaction_WithTransactionalAdapter(t *testing.T) {
+	adapter := newMockTransactionalAdapter()
+	_ = adapter.Adapter.SavePolicy([]string{
+		"p, alice, data1, read",
+	})
+
+	e, err := NewEnforcer(
+		WithModelPath(aclModelPath),
+		WithAdapter(adapter),
+		WithAutoSave(true),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, e)
+	defer e.Close()
+
+	executed := false
+	err = e.ExecuteInTransaction(context.Background(), func() error {
+		executed = true
+		return nil
+	})
+	assert.NoError(t, err)
+	assert.True(t, executed)
+	assert.True(t, adapter.executed, "should use transactional adapter path")
+}
+
+func TestExecuteInTransaction_TransactionalAdapterError(t *testing.T) {
+	adapter := newMockTransactionalAdapter()
+	adapter.err = fmt.Errorf("transaction error")
+	_ = adapter.Adapter.SavePolicy([]string{
+		"p, alice, data1, read",
+	})
+
+	e, err := NewEnforcer(
+		WithModelPath(aclModelPath),
+		WithAdapter(adapter),
+		WithAutoSave(true),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, e)
+	defer e.Close()
+
+	err = e.ExecuteInTransaction(context.Background(), func() error {
+		return nil
+	})
+	assert.Error(t, err)
 }

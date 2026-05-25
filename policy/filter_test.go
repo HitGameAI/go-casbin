@@ -139,4 +139,5 @@ func TestExtractPType(t *testing.T) {
 	assert.Equal(t, "p", ExtractPType("p, alice, data1, read"))
 	assert.Equal(t, "g", ExtractPType("g, alice, admin"))
 	assert.Equal(t, "p", ExtractPType("p"))
+	assert.Equal(t, "", ExtractPType(""))
 }
