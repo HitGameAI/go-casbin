@@ -1054,3 +1054,150 @@ func (rfa *removeFailAdapter) AddPolicies(lines []string) error {
 func (rfa *removeFailAdapter) RemovePolicies(lines []string) error {
 	return errors.NewPolicyAdapterFailedError("batch remove failed")
 }
+
+// mockFilteredAdapter 实现 FilteredAdapter 接口
+type mockFilteredAdapter struct {
+	MemoryAdapter
+	filtered bool
+}
+
+func newMockFilteredAdapter() *mockFilteredAdapter {
+	return &mockFilteredAdapter{MemoryAdapter: *NewMemoryAdapter()}
+}
+
+func (m *mockFilteredAdapter) LoadFilteredPolicy(filter interface{}) ([]string, error) {
+	m.filtered = true
+	return []string{"p, alice, data1, read"}, nil
+}
+
+func (m *mockFilteredAdapter) IsFiltered() bool {
+	return m.filtered
+}
+
+// loadFailAdapter 的 LoadPolicy 总是失败
+type loadFailAdapter struct {
+	MemoryAdapter
+}
+
+func (lfa *loadFailAdapter) LoadPolicy() ([]string, error) {
+	return nil, errors.NewPolicyAdapterFailedError("load failed")
+}
+
+// updateFailAdapter 的 UpdatePolicy/UpdatePolicies 总是失败
+type updateFailAdapter struct {
+	MemoryAdapter
+}
+
+func (u *updateFailAdapter) UpdatePolicy(oldLine, newLine string) error {
+	return errors.NewPolicyAdapterFailedError("update failed")
+}
+
+func (u *updateFailAdapter) UpdatePolicies(oldLines, newLines []string) error {
+	return errors.NewPolicyAdapterFailedError("batch update failed")
+}
+
+func TestPolicy_LoadFilteredPolicy_WithFilteredAdapter(t *testing.T) {
+	adapter := newMockFilteredAdapter()
+	p := newTestPolicyWithAdapter(t, adapter)
+
+	err := p.LoadFilteredPolicy(nil)
+	assert.NoError(t, err)
+	assert.True(t, p.IsFiltered())
+}
+
+func TestPolicy_LoadFilteredPolicy_WithoutFilteredAdapter(t *testing.T) {
+	// 使用一个不实现 FilteredAdapter 的适配器
+	adapter := newBasicAdapter()
+	p := newTestPolicyWithAdapter(t, adapter)
+
+	// 不实现 FilteredAdapter 的适配器应回退到 LoadPolicy
+	err := p.LoadFilteredPolicy(nil)
+	assert.NoError(t, err)
+	assert.False(t, p.IsFiltered())
+}
+
+func TestPolicy_LoadPolicy_AdapterError(t *testing.T) {
+	adapter := &loadFailAdapter{}
+	p := newTestPolicyWithAdapter(t, adapter)
+
+	err := p.LoadPolicy()
+	assert.Error(t, err)
+}
+
+func TestPolicy_UpdatePolicies_AdapterFail(t *testing.T) {
+	adapter := &updateFailAdapter{}
+	p := newTestPolicyWithAdapter(t, adapter)
+
+	err := p.AddPolicy("", "p", []string{"alice", "data1", "read"})
+	require.NoError(t, err)
+
+	err = p.UpdatePolicies("", "p", [][]string{{"alice", "data1", "read"}}, [][]string{{"bob", "data2", "write"}})
+	assert.Error(t, err)
+}
+
+// batchRemoveFailAdapter 的 RemovePolicies 总是失败
+type batchRemoveFailAdapter struct {
+	MemoryAdapter
+}
+
+func (brfa *batchRemoveFailAdapter) RemovePolicies(lines []string) error {
+	return errors.NewPolicyAdapterFailedError("batch remove failed")
+}
+
+func TestPolicy_RemovePolicies_BatchAdapterError(t *testing.T) {
+	adapter := &batchRemoveFailAdapter{}
+	p := newTestPolicyWithAdapter(t, adapter)
+
+	err := p.AddPolicy("", "p", []string{"alice", "data1", "read"})
+	require.NoError(t, err)
+
+	err = p.RemovePolicies("", "p", [][]string{{"alice", "data1", "read"}})
+	assert.Error(t, err)
+}
+
+// addFailOnlyAdapter 的 AddPolicy 总是失败
+type addFailOnlyAdapter struct {
+	MemoryAdapter
+}
+
+func (afoa *addFailOnlyAdapter) AddPolicy(line string) error {
+	return errors.NewPolicyAdapterFailedError("add failed")
+}
+
+func TestPolicy_UpdatePolicies_NonUpdatableAdapter_AddFail(t *testing.T) {
+	// 使用 basicAdapter（不实现 UpdatableAdapter），让 AddPolicy 失败
+	adapter := &addAfterRemoveAdapter{}
+	p := newTestPolicyWithAdapter(t, adapter)
+
+	err := p.AddPolicy("", "p", []string{"alice", "data1", "read"})
+	require.NoError(t, err)
+
+	// 非 UpdatableAdapter 路径：逐条 AddPolicy 失败应回滚
+	err = p.UpdatePolicies("", "p", [][]string{{"alice", "data1", "read"}}, [][]string{{"bob", "data2", "write"}})
+	assert.Error(t, err)
+}
+
+// addAfterRemoveAdapter 不实现 UpdatableAdapter，AddPolicy 第二次调用失败
+type addAfterRemoveAdapter struct {
+	addCount int
+}
+
+func (aara *addAfterRemoveAdapter) LoadPolicy() ([]string, error) {
+	return nil, nil
+}
+
+func (aara *addAfterRemoveAdapter) SavePolicy(policies []string) error {
+	return nil
+}
+
+func (aara *addAfterRemoveAdapter) AddPolicy(line string) error {
+	aara.addCount++
+	if aara.addCount > 1 {
+		return errors.NewPolicyAdapterFailedError("add failed on update")
+	}
+	return nil
+}
+
+func (aara *addAfterRemoveAdapter) RemovePolicy(line string) error {
+	return nil
+}

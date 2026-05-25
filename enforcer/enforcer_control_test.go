@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-03-28 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2026-05-25 10:15:20
+ * @LastEditTime: 2026-05-25 11:13:26
  * @FilePath: \go-casbin\enforcer\enforcer_control_test.go
  * @Description: 测试控制模型
  *
@@ -1230,5 +1230,149 @@ func TestValidatePolicyRule_GType(t *testing.T) {
 
 	// g 段策略不强制校验字段数量
 	err := e.validatePolicyRule(model.SectionRoleDefinition, "g", []string{"alice", "admin", "tenant1", "extra"})
+	assert.NoError(t, err)
+}
+
+func TestRemoveGroupingPolicies(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	err := e.AddGroupingPolicies([][]string{
+		{"alice", "admin"},
+		{"bob", "viewer"},
+	})
+	require.NoError(t, err)
+
+	err = e.RemoveGroupingPolicies([][]string{
+		{"alice", "admin"},
+	})
+	assert.NoError(t, err)
+	assert.False(t, e.HasGroupingPolicy("alice", "admin"))
+	assert.True(t, e.HasGroupingPolicy("bob", "viewer"))
+}
+
+func TestRemoveGroupingPolicies_WithDomain(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	err := e.AddGroupingPolicies([][]string{
+		{"alice", "admin", "tenant1"},
+		{"bob", "viewer", "tenant1"},
+	})
+	require.NoError(t, err)
+
+	err = e.RemoveGroupingPolicies([][]string{
+		{"alice", "admin", "tenant1"},
+	})
+	assert.NoError(t, err)
+}
+
+func TestGetImplicitUsersForPermission_WithImplicitUsers(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	// rbac 策略文件中已有 admin 角色的策略和 alice→admin 分组
+	// 添加新的隐式用户
+	err := e.AddGroupingPolicy("charlie", "admin")
+	require.NoError(t, err)
+
+	users := e.GetImplicitUsersForPermission("data1", "read")
+	assert.Contains(t, users, "admin")
+	assert.Contains(t, users, "charlie")
+}
+
+func TestGetPolicyAssertion_Fallback(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	// 正常情况应返回 p 段断言
+	assertion := e.getPolicyAssertion()
+	assert.NotNil(t, assertion)
+}
+
+func TestEnforceContext_BreakerOpen(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	// 创建一个快速打开的熔断器
+	b := breaker.New("test-breaker", breaker.Config{MaxFailures: 1, ResetTimeout: time.Hour})
+	e.breaker = b
+
+	// 触发熔断器打开
+	_ = b.Execute(func() error {
+		return fmt.Errorf("forced failure")
+	})
+
+	ctx := context.Background()
+	ok, err := e.EnforceContext(ctx, "alice", "data1", "read")
+	// 熔断器开启时应返回错误
+	assert.Error(t, err)
+	assert.False(t, ok)
+}
+
+func TestAddGroupingPolicy_AdapterSaveError(t *testing.T) {
+	adapter := newAddFailAdapter()
+	e, err := NewEnforcer(
+		WithModelPath(rbacModelPath),
+		WithAdapter(adapter),
+		WithAutoSave(true),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, e)
+	defer e.Close()
+
+	// AddGroupingPolicy 的 autoSave 路径中 adapter.AddPolicy 失败
+	err = e.AddGroupingPolicy("charlie", "admin")
+	assert.Error(t, err)
+}
+
+func TestRemoveGroupingPolicy_AdapterRemoveError(t *testing.T) {
+	adapter := &removeGroupingFailAdapter{}
+	_ = adapter.SavePolicy([]string{
+		"p, alice, data1, read",
+		"g, alice, admin",
+	})
+
+	e, err := NewEnforcer(
+		WithModelPath(rbacModelPath),
+		WithAdapter(adapter),
+		WithAutoSave(true),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, e)
+	defer e.Close()
+
+	// RemoveGroupingPolicy 的 autoSave 路径中 adapter.RemovePolicy 失败
+	err = e.RemoveGroupingPolicy("alice", "admin")
+	assert.Error(t, err)
+}
+
+// removeGroupingFailAdapter 的 RemovePolicy 总是失败
+type removeGroupingFailAdapter struct {
+	policy.MemoryAdapter
+}
+
+func (rgfa *removeGroupingFailAdapter) RemovePolicy(line string) error {
+	return fmt.Errorf("adapter remove failed")
+}
+
+func TestAddGroupingPolicy_WithDomain(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	// len(params) >= 3 的 domain 路径
+	err := e.AddGroupingPolicy("charlie", "admin", "tenant1")
+	assert.NoError(t, err)
+}
+
+func TestRemoveGroupingPolicy_WithDomain(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	err := e.AddGroupingPolicy("charlie", "admin", "tenant1")
+	require.NoError(t, err)
+
+	// len(params) >= 3 的 domain 路径
+	err = e.RemoveGroupingPolicy("charlie", "admin", "tenant1")
 	assert.NoError(t, err)
 }

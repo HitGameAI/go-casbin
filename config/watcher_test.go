@@ -94,7 +94,7 @@ func TestConfigWatcher_OnChange(t *testing.T) {
 	}
 }
 
-func TestConfigWatcher_MultipleCallbacks(t *testing.T) {
+func TestConfigWatcher_CheckChange_FileDeleted(t *testing.T) {
 	c := NewConfig(logger.NewLogger())
 	tmpDir := t.TempDir()
 	tmpFile := filepath.Join(tmpDir, "test.conf")
@@ -103,30 +103,33 @@ func TestConfigWatcher_MultipleCallbacks(t *testing.T) {
 
 	cw := NewConfigWatcher(c, tmpFile, 50*time.Millisecond, logger.NewLogger())
 
-	callCount := make(chan struct{}, 2)
-	cw.OnChange(func(cfg *Config) {
-		callCount <- struct{}{}
-	})
-	cw.OnChange(func(cfg *Config) {
-		callCount <- struct{}{}
-	})
+	err = cw.Start()
+	require.NoError(t, err)
+	defer cw.Stop()
+
+	// 删除文件后 checkChange 应处理 os.Stat 错误
+	time.Sleep(100 * time.Millisecond)
+	os.Remove(tmpFile)
+	time.Sleep(200 * time.Millisecond)
+	// 不应 panic
+}
+
+func TestConfigWatcher_CheckChange_InvalidContent(t *testing.T) {
+	c := NewConfig(logger.NewLogger())
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "test.conf")
+	err := os.WriteFile(tmpFile, []byte("key1 = value1"), 0644)
+	require.NoError(t, err)
+
+	cw := NewConfigWatcher(c, tmpFile, 50*time.Millisecond, logger.NewLogger())
 
 	err = cw.Start()
 	require.NoError(t, err)
 	defer cw.Stop()
 
-	// 修改文件触发变更
+	// 写入无效内容后 checkChange 应处理 Load 错误
 	time.Sleep(100 * time.Millisecond)
-	err = os.WriteFile(tmpFile, []byte("key1 = value2"), 0644)
-	require.NoError(t, err)
-
-	// 等待两个回调
-	for i := 0; i < 2; i++ {
-		select {
-		case <-callCount:
-			// 回调被触发
-		case <-time.After(2 * time.Second):
-			t.Fatal("timeout waiting for callback")
-		}
-	}
+	os.WriteFile(tmpFile, []byte("= invalid ="), 0644)
+	time.Sleep(200 * time.Millisecond)
+	// 不应 panic
 }

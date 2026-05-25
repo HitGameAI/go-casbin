@@ -76,9 +76,14 @@ func TestFilter_FromSlice(t *testing.T) {
 }
 
 func TestFilterFromSlice(t *testing.T) {
-	f := FilterFromSlice([]string{"p", "alice", "data1"})
+	f := FilterFromSlice([]string{"p", "alice", "data1", "read", "tenant1", "extra", "field"})
 	assert.Equal(t, "p", f.PType)
 	assert.Equal(t, "alice", f.V0)
+	assert.Equal(t, "data1", f.V1)
+	assert.Equal(t, "read", f.V2)
+	assert.Equal(t, "tenant1", f.V3)
+	assert.Equal(t, "extra", f.V4)
+	assert.Equal(t, "field", f.V5)
 }
 
 func TestFilter_Match(t *testing.T) {

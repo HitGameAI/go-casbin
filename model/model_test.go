@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-03-28 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2025-03-28 00:00:00
+ * @LastEditTime: 2026-05-25 10:36:34
  * @FilePath: \go-casbin\model\model_test.go
  * @Description: 模型核心测试
  *
@@ -131,5 +131,47 @@ func TestModel_GetValuesForFieldInPolicyAllTypes(t *testing.T) {
 func TestModel_LoadFromText_InvalidModel(t *testing.T) {
 	m := NewModel(newTestLogger())
 	err := m.LoadFromText("invalid content")
+	assert.Error(t, err)
+}
+
+func TestModel_LoadFromPath_NotFound(t *testing.T) {
+	m := NewModel(newTestLogger())
+	err := m.LoadFromPath("nonexistent_model.conf")
+	assert.Error(t, err)
+}
+
+func TestModel_Copy_DeepCopySuccess(t *testing.T) {
+	m, err := NewModelFromText(testModelText, newTestLogger())
+	require.NoError(t, err)
+
+	m.GetAssertion("p").AddPolicy([]string{"alice", "data1", "read"})
+
+	cp := m.Copy()
+	require.NotNil(t, cp)
+
+	// 修改副本不应影响原模型
+	cp.GetAssertion("p").AddPolicy([]string{"bob", "data2", "write"})
+	assert.Len(t, m.GetAssertion("p").Policies, 1)
+	assert.Len(t, cp.GetAssertion("p").Policies, 2)
+}
+
+func TestValidatePolicyDefinition_NoTokens(t *testing.T) {
+	m := NewModel(newTestLogger())
+	// 添加没有 token 的策略定义
+	err := m.AddDef("p", "")
+	assert.NoError(t, err)
+
+	// 验证应失败
+	err = validatePolicyDefinition(m.GetAssertions())
+	assert.Error(t, err)
+}
+
+func TestValidatePolicyEffect_Empty(t *testing.T) {
+	m := NewModel(newTestLogger())
+	// 添加空的 effect 定义
+	err := m.AddDef("e", "")
+	assert.NoError(t, err)
+
+	err = validatePolicyEffect(m.GetAssertions())
 	assert.Error(t, err)
 }

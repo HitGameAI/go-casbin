@@ -60,6 +60,7 @@ func TestPolicyErrors(t *testing.T) {
 		{"BatchUpdateFailed", NewPolicyBatchUpdateFailedError("rollback")},
 		{"AutoMigrateFailed", NewPolicyAutoMigrateFailedError("table")},
 		{"GetByTypeFailed", NewPolicyGetByTypeFailedError("p2")},
+		{"RuleInvalid", NewPolicyRuleInvalidError("empty rule")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
