@@ -472,6 +472,13 @@ func (fua *failingUpdatableAdapter) UpdateFilteredPolicies(newLines []string, fi
 	return fua.MemoryAdapter.UpdateFilteredPolicies(newLines, fieldIndex, fieldValues...)
 }
 
+func (fua *failingUpdatableAdapter) UpdateFilteredPoliciesByPType(ptype string, newLines []string, fieldIndex int, fieldValues ...string) error {
+	if fua.failUpdateFilteredPolicies {
+		return errors.NewPolicyAdapterFailedError("update filtered policies failed")
+	}
+	return fua.MemoryAdapter.UpdateFilteredPoliciesByPType(ptype, newLines, fieldIndex, fieldValues...)
+}
+
 // ==================== UpdatableAdapter 分支测试 ====================
 
 func TestPolicy_RemoveFilteredPolicy_WithUpdatableAdapter(t *testing.T) {

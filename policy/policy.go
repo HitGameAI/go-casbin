@@ -111,12 +111,7 @@ func (p *Policy) SavePolicy() error {
 		return errors.NewPolicyAdapterFailedError("adapter is nil")
 	}
 
-	var policies []string
-	for key, assertion := range p.model.GetAssertions() {
-		for _, policy := range assertion.Policies {
-			policies = append(policies, key+", "+strings.Join(policy, ", "))
-		}
-	}
+	policies := p.allPolicyLines()
 
 	if err := p.adapter.SavePolicy(policies); err != nil {
 		return errors.WrapError("SavePolicy", err)
@@ -332,12 +327,20 @@ func (p *Policy) RemoveFilteredPolicy(sec, ptype string, fieldIndex int, fieldVa
 	}
 
 	if p.autoSave && p.adapter != nil {
-		if ua, ok := p.adapter.(UpdatableAdapter); ok {
-			var newLines []string
-			for _, r := range remaining {
-				newLines = append(newLines, ptype+", "+strings.Join(r, ", "))
+		if pa, ok := p.adapter.(PTypeUpdatableAdapter); ok {
+			if err := pa.UpdateFilteredPoliciesByPType(ptype, nil, fieldIndex, fieldValues...); err != nil {
+				// 回滚内存：恢复被删除的策略
+				assertion.ClearPolicies()
+				for _, r := range removed {
+					assertion.AddPolicy(r)
+				}
+				for _, r := range remaining {
+					assertion.AddPolicy(r)
+				}
+				return errors.WrapError("RemoveFilteredPolicy", err)
 			}
-			if err := ua.UpdateFilteredPolicies(newLines, fieldIndex, fieldValues...); err != nil {
+		} else if ua, ok := p.adapter.(UpdatableAdapter); ok {
+			if err := ua.UpdateFilteredPolicies(nil, fieldIndex, fieldValues...); err != nil {
 				// 回滚内存：恢复被删除的策略
 				assertion.ClearPolicies()
 				for _, r := range removed {
@@ -358,6 +361,83 @@ func (p *Policy) RemoveFilteredPolicy(sec, ptype string, fieldIndex int, fieldVa
 
 	p.cache.Invalidate(ptype)
 	p.logger.InfoKV("Filtered policies removed", "type", ptype, "count", len(removed))
+	return nil
+}
+
+// allPolicyLines 获取所有策略的行表示
+func (p *Policy) allPolicyLines() []string {
+	var policies []string
+	for key, assertion := range p.model.GetAssertions() {
+		for _, policy := range assertion.Policies {
+			policies = append(policies, key+", "+strings.Join(policy, ", "))
+		}
+	}
+	return policies
+}
+
+// UpdateFilteredPolicies 按字段索引和值过滤更新策略
+// 先移除匹配的旧策略，再追加新策略
+// 适用于需要按策略类型更新 p 和 g 规则的场景
+func (p *Policy) UpdateFilteredPolicies(sec, ptype string, newPolicies [][]string, fieldIndex int, fieldValues ...string) error {
+	assertion := p.model.GetAssertion(ptype)
+	if assertion == nil {
+		return errors.NewPolicyNotFoundError(ptype)
+	}
+
+	oldPolicies := make([][]string, len(assertion.Policies))
+	for i, rule := range assertion.Policies {
+		oldPolicies[i] = append([]string(nil), rule...)
+	}
+
+	var remaining [][]string
+	for _, rule := range assertion.Policies {
+		match := true
+		for i, value := range fieldValues {
+			if fieldIndex+i < len(rule) && rule[fieldIndex+i] != value {
+				match = false
+				break
+			}
+		}
+		if !match {
+			remaining = append(remaining, rule)
+		}
+	}
+
+	assertion.ClearPolicies()
+	for _, rule := range remaining {
+		assertion.AddPolicy(rule)
+	}
+	for _, rule := range newPolicies {
+		if !assertion.HasPolicy(rule) {
+			assertion.AddPolicy(rule)
+		}
+	}
+
+	if p.autoSave && p.adapter != nil {
+		var newLines []string
+		for _, rule := range newPolicies {
+			newLines = append(newLines, ptype+", "+strings.Join(rule, ", "))
+		}
+
+		var err error
+		if pa, ok := p.adapter.(PTypeUpdatableAdapter); ok {
+			err = pa.UpdateFilteredPoliciesByPType(ptype, newLines, fieldIndex, fieldValues...)
+		} else if ua, ok := p.adapter.(UpdatableAdapter); ok {
+			err = ua.UpdateFilteredPolicies(newLines, fieldIndex, fieldValues...)
+		} else {
+			err = p.adapter.SavePolicy(p.allPolicyLines())
+		}
+		if err != nil {
+			assertion.ClearPolicies()
+			for _, rule := range oldPolicies {
+				assertion.AddPolicy(rule)
+			}
+			return errors.WrapError("UpdateFilteredPolicies", err)
+		}
+	}
+
+	p.cache.Invalidate(ptype)
+	p.logger.InfoKV("Filtered policies updated", "type", ptype, "count", len(newPolicies))
 	return nil
 }
 

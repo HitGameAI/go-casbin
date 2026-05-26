@@ -57,6 +57,14 @@ type UpdatableAdapter interface {
 	UpdateFilteredPolicies(newLines []string, fieldIndex int, fieldValues ...string) error // 按过滤条件更新策略
 }
 
+// PTypeUpdatableAdapter 支持按策略类型更新操作的适配器接口
+// 扩展 UpdatableAdapter，增加按策略类型更新的能力
+// 适用于需要按策略类型更新 p 和 g 规则的场景
+type PTypeUpdatableAdapter interface {
+	Adapter
+	UpdateFilteredPoliciesByPType(ptype string, newLines []string, fieldIndex int, fieldValues ...string) error
+}
+
 // ==================== 带 Context 的适配器接口 ====================
 // 以下接口为适配器提供 context.Context 支持，用于超时控制和分布式链路追踪
 // 适配器可同时实现非 ctx 和 WithCtx 两套接口，非 ctx 方法内部调用 WithCtx 并传入 context.Background()
@@ -95,6 +103,14 @@ type UpdatableContextAdapter interface {
 	UpdatePolicyWithCtx(ctx context.Context, oldLine, newLine string) error                                            // 带上下文更新单条策略
 	UpdatePoliciesWithCtx(ctx context.Context, oldLines, newLines []string) error                                      // 带上下文批量更新策略
 	UpdateFilteredPoliciesWithCtx(ctx context.Context, newLines []string, fieldIndex int, fieldValues ...string) error // 带上下文按过滤条件更新策略
+}
+
+// PTypeUpdatableContextAdapter 支持 Context 和按策略类型更新操作的适配器接口
+// 扩展 ContextAdapter，增加带上下文的按策略类型更新能力
+// 适用于需要按策略类型更新 p 和 g 规则的场景
+type PTypeUpdatableContextAdapter interface {
+	ContextAdapter
+	UpdateFilteredPoliciesByPTypeWithCtx(ctx context.Context, ptype string, newLines []string, fieldIndex int, fieldValues ...string) error
 }
 
 // FullAdapter 全功能适配器接口
@@ -308,6 +324,39 @@ func (fa *FileAdapter) UpdateFilteredPolicies(newLines []string, fieldIndex int,
 	return fa.SavePolicy(result)
 }
 
+// UpdateFilteredPoliciesByPType 按策略类型更新文件中的策略
+// 先移除匹配的旧策略，再追加新策略
+// 适用于需要按策略类型更新 p 和 g 规则的场景
+func (fa *FileAdapter) UpdateFilteredPoliciesByPType(ptype string, newLines []string, fieldIndex int, fieldValues ...string) error {
+	policies, err := fa.LoadPolicy()
+	if err != nil {
+		return err
+	}
+
+	var result []string
+	for _, p := range policies {
+		tokens := strings.Split(p, ",")
+		if len(tokens) == 0 || strings.TrimSpace(tokens[0]) != ptype {
+			result = append(result, p)
+			continue
+		}
+		match := true
+		for i, val := range fieldValues {
+			idx := fieldIndex + i + 1
+			if idx >= len(tokens) || strings.TrimSpace(tokens[idx]) != val {
+				match = false
+				break
+			}
+		}
+		if !match {
+			result = append(result, p)
+		}
+	}
+
+	result = append(result, newLines...)
+	return fa.SavePolicy(result)
+}
+
 // LoadFilteredPolicy 按过滤条件从文件加载策略
 func (fa *FileAdapter) LoadFilteredPolicy(filter interface{}) ([]string, error) {
 	fa.filtered = true
@@ -454,6 +503,35 @@ func (ma *MemoryAdapter) UpdateFilteredPolicies(newLines []string, fieldIndex in
 		match := true
 		for i, val := range fieldValues {
 			idx := fieldIndex + i
+			if idx >= len(tokens) || strings.TrimSpace(tokens[idx]) != val {
+				match = false
+				break
+			}
+		}
+		if !match {
+			result = append(result, p)
+		}
+	}
+
+	result = append(result, newLines...)
+	ma.policies = result
+	return nil
+}
+
+// UpdateFilteredPoliciesByPType 按策略类型更新内存中的策略
+// 先移除匹配的旧策略，再追加新策略
+// 适用于需要按策略类型更新 p 和 g 规则的场景
+func (ma *MemoryAdapter) UpdateFilteredPoliciesByPType(ptype string, newLines []string, fieldIndex int, fieldValues ...string) error {
+	var result []string
+	for _, p := range ma.policies {
+		tokens := strings.Split(p, ",")
+		if len(tokens) == 0 || strings.TrimSpace(tokens[0]) != ptype {
+			result = append(result, p)
+			continue
+		}
+		match := true
+		for i, val := range fieldValues {
+			idx := fieldIndex + i + 1
 			if idx >= len(tokens) || strings.TrimSpace(tokens[idx]) != val {
 				match = false
 				break

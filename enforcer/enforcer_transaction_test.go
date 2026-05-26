@@ -75,6 +75,50 @@ func TestTransactionalSyncUserRolesWithDomain(t *testing.T) {
 	assert.Empty(t, roles, "alice should have no roles in tenant1 after sync")
 }
 
+func TestTransactionalSyncUserRolesPersistsGroupingPolicies(t *testing.T) {
+	e := newMemoryEnforcer(t, rbacDomainModelPath)
+
+	groupingRules := [][]string{
+		{"alice", "viewer", "tenant2"},
+	}
+	err := e.TransactionalSyncUserRoles(context.Background(), "alice", groupingRules)
+	require.NoError(t, err)
+
+	policies, err := e.policy.GetAdapter().LoadPolicy()
+	require.NoError(t, err)
+	assert.Contains(t, policies, "g, alice, viewer, tenant2")
+
+	err = e.TransactionalSyncUserRoles(context.Background(), "alice", groupingRules)
+	require.NoError(t, err)
+
+	policies, err = e.policy.GetAdapter().LoadPolicy()
+	require.NoError(t, err)
+	count := 0
+	for _, line := range policies {
+		if line == "g, alice, viewer, tenant2" {
+			count++
+		}
+	}
+	assert.Equal(t, 1, count, "repeated sync should not duplicate persisted grouping rules")
+}
+
+func TestRemoveFilteredGroupingPolicyDoesNotRemovePolicyRules(t *testing.T) {
+	e := newMemoryEnforcer(t, rbacDomainModelPath)
+
+	err := e.AddPolicy("alice", "tenant1", "data1", "read")
+	require.NoError(t, err)
+	err = e.AddGroupingPolicy("alice", "admin", "tenant1")
+	require.NoError(t, err)
+
+	err = e.RemoveFilteredGroupingPolicy(0, "alice")
+	require.NoError(t, err)
+
+	policies, err := e.policy.GetAdapter().LoadPolicy()
+	require.NoError(t, err)
+	assert.Contains(t, policies, "p, alice, tenant1, data1, read")
+	assert.NotContains(t, policies, "g, alice, admin, tenant1")
+}
+
 func TestTransactionalDeleteUser(t *testing.T) {
 	e := newMemoryEnforcer(t, rbacModelPath)
 

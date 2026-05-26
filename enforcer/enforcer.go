@@ -684,18 +684,7 @@ func (e *Enforcer) UpdateFilteredPolicies(newPolicies [][]string, fieldIndex int
 	}
 
 	e.invalidateExtraPoliciesCache()
-
-	if e.policy.GetAdapter() != nil {
-		if ua, ok := e.policy.GetAdapter().(policy.UpdatableAdapter); ok {
-			var newLines []string
-			for _, np := range newPolicies {
-				newLines = append(newLines, "p, "+strings.Join(np, ", "))
-			}
-			return ua.UpdateFilteredPolicies(newLines, fieldIndex, fieldValues...)
-		}
-	}
-
-	return e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, "p", fieldIndex, fieldValues...)
+	return e.policy.UpdateFilteredPolicies(model.SectionPolicyDefinition, "p", newPolicies, fieldIndex, fieldValues...)
 }
 
 // ==================== 角色分组策略 API ====================
@@ -717,13 +706,6 @@ func (e *Enforcer) AddGroupingPolicy(params ...string) error {
 		}
 		if err := e.roleMgr.AddLink(params[0], params[1], domain...); err != nil {
 			return err
-		}
-	}
-
-	if e.autoSave && e.policy.GetAdapter() != nil {
-		line := "g, " + strings.Join(params, ", ")
-		if err := e.policy.GetAdapter().AddPolicy(line); err != nil {
-			return errors.WrapError("auto-save grouping policy", err)
 		}
 	}
 
@@ -749,18 +731,6 @@ func (e *Enforcer) AddGroupingPolicies(rules [][]string) error {
 					domain = append(domain, rule[2])
 				}
 				_ = e.roleMgr.AddLink(rule[0], rule[1], domain...)
-			}
-		}
-	}
-
-	if e.autoSave && e.policy.GetAdapter() != nil {
-		if ba, ok := e.policy.GetAdapter().(policy.BatchAdapter); ok {
-			var lines []string
-			for _, rule := range rules {
-				lines = append(lines, "g, "+strings.Join(rule, ", "))
-			}
-			if err := ba.AddPolicies(lines); err != nil {
-				return errors.WrapError("auto-save grouping policies", err)
 			}
 		}
 	}
@@ -865,19 +835,6 @@ func (e *Enforcer) RemoveFilteredGroupingPolicy(fieldIndex int, fieldValues ...s
 					domain = append(domain, rule[2])
 				}
 				e.roleMgr.DeleteLink(rule[0], rule[1], domain...)
-			}
-		}
-	}
-
-	if e.autoSave && e.policy.GetAdapter() != nil {
-		if ua, ok := e.policy.GetAdapter().(policy.UpdatableAdapter); ok {
-			if err := ua.UpdateFilteredPolicies(nil, fieldIndex, fieldValues...); err != nil {
-				return errors.WrapError("auto-remove filtered grouping policy", err)
-			}
-		} else {
-			for _, rule := range removed {
-				line := "g, " + strings.Join(rule, ", ")
-				_ = e.policy.GetAdapter().RemovePolicy(line)
 			}
 		}
 	}
@@ -1311,9 +1268,12 @@ func (e *Enforcer) GetAllRolesByDomain(domain string) []string {
 // 适配器支持事务时，所有操作在同一个数据库事务中执行
 func (e *Enforcer) ExecuteInTransaction(ctx context.Context, fn func() error) error {
 	if ta, ok := e.policy.GetAdapter().(policy.TransactionalAdapter); ok {
-		return ta.ExecuteInTransaction(ctx, func(_ policy.Adapter) error {
+		return ta.ExecuteInTransaction(ctx, func(txAdapter policy.Adapter) error {
 			e.mu.Lock()
 			defer e.mu.Unlock()
+			prevAdapter := e.policy.GetAdapter()
+			e.policy.SetAdapter(txAdapter)
+			defer e.policy.SetAdapter(prevAdapter)
 			return fn()
 		})
 	}
@@ -1340,10 +1300,8 @@ func (e *Enforcer) TransactionalSyncUserRoles(ctx context.Context, user string, 
 					e.roleMgr.DeleteLink(rule[0], rule[1], domain...)
 				}
 			}
-			if e.autoSave && e.policy.GetAdapter() != nil {
-				if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 0, user); err != nil {
-					return err
-				}
+			if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 0, user); err != nil {
+				return err
 			}
 		}
 
@@ -1364,17 +1322,6 @@ func (e *Enforcer) TransactionalSyncUserRoles(ctx context.Context, user string, 
 				}
 			}
 
-			if e.autoSave && e.policy.GetAdapter() != nil {
-				if ba, ok := e.policy.GetAdapter().(policy.BatchAdapter); ok {
-					var lines []string
-					for _, rule := range groupingRules {
-						lines = append(lines, "g, "+strings.Join(rule, ", "))
-					}
-					if err := ba.AddPolicies(lines); err != nil {
-						return errors.WrapError("auto-save grouping policies in transaction", err)
-					}
-				}
-			}
 		}
 
 		e.notifyPolicyChange(policy.EventTypePolicyAdded, "g", nil, nil)
@@ -1401,12 +1348,6 @@ func (e *Enforcer) TransactionalDeleteUser(ctx context.Context, user string) err
 		}
 		_ = e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 0, user)
 
-		if e.autoSave && e.policy.GetAdapter() != nil {
-			if ua, ok := e.policy.GetAdapter().(policy.UpdatableAdapter); ok {
-				_ = ua.UpdateFilteredPolicies(nil, 0, user)
-			}
-		}
-
 		e.notifyPolicyChange(policy.EventTypePolicyRemoved, "p", nil, nil)
 		e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", nil, nil)
 
@@ -1425,13 +1366,6 @@ func (e *Enforcer) TransactionalDeleteRole(ctx context.Context, roleName string)
 
 		_ = e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 1, roleName)
 		_ = e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, "p", 0, roleName)
-
-		if e.autoSave && e.policy.GetAdapter() != nil {
-			if ua, ok := e.policy.GetAdapter().(policy.UpdatableAdapter); ok {
-				_ = ua.UpdateFilteredPolicies(nil, 1, roleName)
-				_ = ua.UpdateFilteredPolicies(nil, 0, roleName)
-			}
-		}
 
 		e.notifyPolicyChange(policy.EventTypePolicyRemoved, "p", nil, nil)
 		e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", nil, nil)
