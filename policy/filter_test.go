@@ -146,3 +146,72 @@ func TestExtractPType(t *testing.T) {
 	assert.Equal(t, "p", ExtractPType("p"))
 	assert.Equal(t, "", ExtractPType(""))
 }
+
+
+func TestInferPType(t *testing.T) {
+	tests := []struct {
+		name  string
+		lines []string
+		want  string
+	}{
+		{name: "empty", lines: nil, want: ""},
+		{name: "single type", lines: []string{"p, alice, data1, read", "p, bob, data2, write"}, want: "p"},
+		{name: "mixed types", lines: []string{"p, alice, data1, read", "g, alice, role1"}, want: ""},
+		{name: "blank type", lines: []string{", alice, data1"}, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := InferPType(tt.lines); got != tt.want {
+				t.Fatalf("InferPType() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPolicyValueIndexFiltering(t *testing.T) {
+	lines := []string{
+		"p, alice, ops, /v1/users, GET",
+		"p, bob, ops, /v1/users, GET",
+		"g, alice, role:admin, ops",
+	}
+
+	if !MatchPolicyValuesByIndex(lines[0], 0, "alice") {
+		t.Fatal("expected V0 match")
+	}
+	if MatchPolicyValuesByIndex(lines[0], 0, "p") {
+		t.Fatal("fieldIndex=0 must match V0, not PType")
+	}
+	if !MatchPolicyValuesByIndex(lines[0], 1, "ops", "/v1/users") {
+		t.Fatal("expected consecutive values match")
+	}
+	if MatchPolicyValuesByIndex(lines[0], 4, "extra") {
+		t.Fatal("out of range match should fail")
+	}
+
+	got := FilterPoliciesByValueIndex(lines, "g", 0, "alice")
+	want := []string{"g, alice, role:admin, ops"}
+	if !equalStrings(got, want) {
+		t.Fatalf("FilterPoliciesByValueIndex() = %v, want %v", got, want)
+	}
+
+	got = FilterPoliciesByPType(lines, "p")
+	want = []string{
+		"p, alice, ops, /v1/users, GET",
+		"p, bob, ops, /v1/users, GET",
+	}
+	if !equalStrings(got, want) {
+		t.Fatalf("FilterPoliciesByPType() = %v, want %v", got, want)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

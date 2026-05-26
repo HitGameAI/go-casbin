@@ -174,6 +174,76 @@ func FilterPoliciesByIndex(policies []string, fieldIndex int, fieldValues ...str
 	return result
 }
 
+// InferPType 从策略行列表中推断单一 ptype。
+// 如果列表为空、包含空 ptype，或包含多个不同 ptype，则返回空字符串。
+func InferPType(lines []string) string {
+	var ptype string
+	for _, line := range lines {
+		linePType := ExtractPType(line)
+		if linePType == "" {
+			return ""
+		}
+		if ptype == "" {
+			ptype = linePType
+			continue
+		}
+		if ptype != linePType {
+			return ""
+		}
+	}
+	return ptype
+}
+
+// FilterPoliciesByPType 只保留指定 ptype 的策略行。
+func FilterPoliciesByPType(lines []string, ptype string) []string {
+	result := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if ExtractPType(line) == ptype {
+			result = append(result, line)
+		}
+	}
+	return result
+}
+
+// MatchPolicyValuesByIndex 按策略值字段匹配，不包含 ptype。
+// fieldIndex=0 表示 V0，而不是 PType；用于 adapter 的 filtered update/remove 语义。
+func MatchPolicyValuesByIndex(line string, fieldIndex int, fieldValues ...string) bool {
+	if len(fieldValues) == 0 {
+		return true
+	}
+	parts := strings.Split(line, ",")
+	values := make([]string, 0, len(parts)-1)
+	for i := 1; i < len(parts); i++ {
+		values = append(values, strings.TrimSpace(parts[i]))
+	}
+	for i, val := range fieldValues {
+		idx := fieldIndex + i
+		if idx >= len(values) || values[idx] != val {
+			return false
+		}
+	}
+	return true
+}
+
+// FilterPoliciesByValueIndex 按策略值字段过滤，可选 ptype 限定。
+// fieldIndex=0 表示 V0；ptype 为空时不过滤策略类型。
+func FilterPoliciesByValueIndex(lines []string, ptype string, fieldIndex int, fieldValues ...string) []string {
+	if len(fieldValues) == 0 && ptype == "" {
+		return append([]string(nil), lines...)
+	}
+
+	result := make([]string, 0)
+	for _, line := range lines {
+		if ptype != "" && ExtractPType(line) != ptype {
+			continue
+		}
+		if MatchPolicyValuesByIndex(line, fieldIndex, fieldValues...) {
+			result = append(result, line)
+		}
+	}
+	return result
+}
+
 // ExtractPType 从策略行提取 PType（策略类型）
 // 策略行格式为 "p, alice, data1, read"，提取第一个逗号前的部分
 func ExtractPType(line string) string {
