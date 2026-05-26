@@ -48,11 +48,47 @@ var paramPatternRe = regexp.MustCompile(`:[^/]+`)
 // braceParamPatternRe 预编译的路径参数匹配正则（{param} 风格）
 var braceParamPatternRe = regexp.MustCompile(`\{[^/]+\}`)
 
+// normalizeKeyMatchPath 规范 KeyMatch 路径参数，移除查询参数和尾部斜杠
+// 例如：/foo/bar → /foo/bar
+// 例如：/foo/bar?query → /foo/bar
+// 例如：/ → /
+func normalizeKeyMatchPath(key string, trimTrailingSlash bool) string {
+	key = strings.TrimSpace(key)
+	if !strings.HasPrefix(key, "/") {
+		return key
+	}
+	if idx := strings.IndexByte(key, '?'); idx >= 0 {
+		key = key[:idx]
+	}
+	if trimTrailingSlash && key != "/" {
+		key = strings.TrimRight(key, "/")
+	}
+	if key == "" {
+		return "/"
+	}
+	return key
+}
+
+// hasWildcardPathSuffix 检查路径是否以 /* 结尾，用于 KeyMatch 匹配
+// 例如：/foo/bar → false
+// 例如：/foo/* → true
+// 例如：/foo/bar/baz → false
+func hasWildcardPathSuffix(key string) bool {
+	key = strings.TrimSpace(key)
+	if idx := strings.IndexByte(key, '?'); idx >= 0 {
+		key = key[:idx]
+	}
+	return strings.HasSuffix(key, "/*")
+}
+
 // KeyMatch 路径通配符匹配（简易版）
 // 仅支持 * 通配符，匹配前缀部分
 // 例如：KeyMatch("/foo/bar", "/foo/*") → true
 // 例如：KeyMatch("/foo/bar", "/foo/baz") → false
 func KeyMatch(key1, key2 string) bool {
+	trimRequestTrailingSlash := !hasWildcardPathSuffix(key2)
+	key1 = normalizeKeyMatchPath(key1, trimRequestTrailingSlash)
+	key2 = normalizeKeyMatchPath(key2, true)
 	i := strings.Index(key2, "*")
 	if i == -1 {
 		return key1 == key2
@@ -76,6 +112,9 @@ func KeyMatchFunc(args ...interface{}) (interface{}, error) {
 // 例如：KeyMatch2("/foo/bar", "/foo/:bar") → true
 // 例如：KeyMatch2("/foo/bar/baz", "/foo/*") → true（/* 转为 /.*）
 func KeyMatch2(key1, key2 string) bool {
+	trimRequestTrailingSlash := !hasWildcardPathSuffix(key2)
+	key1 = normalizeKeyMatchPath(key1, trimRequestTrailingSlash)
+	key2 = normalizeKeyMatchPath(key2, true)
 	key2 = strings.ReplaceAll(key2, "/*", "/.*")
 	key2 = paramPatternRe.ReplaceAllString(key2, "$1[^/]+$2")
 	return RegexMatch(key1, "^"+key2+"$")
@@ -94,6 +133,9 @@ func KeyMatch2Func(args ...interface{}) (interface{}, error) {
 // 例如：KeyMatch3("/foo/bar", "/foo/{bar}") → true
 // 与 KeyMatch2 类似，但使用花括号而非冒号表示路径参数
 func KeyMatch3(key1, key2 string) bool {
+	trimRequestTrailingSlash := !hasWildcardPathSuffix(key2)
+	key1 = normalizeKeyMatchPath(key1, trimRequestTrailingSlash)
+	key2 = normalizeKeyMatchPath(key2, true)
 	key2 = strings.ReplaceAll(key2, "/*", "/.*")
 	key2 = braceParamPatternRe.ReplaceAllString(key2, "[^/]+")
 	return RegexMatch(key1, "^"+key2+"$")

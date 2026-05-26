@@ -2044,7 +2044,7 @@ func (e *Enforcer) validateRequest(rvals []interface{}) error {
 
 	// 校验字符串参数不能为空（空 sub/obj/act 会导致误判）
 	for i, val := range rvals {
-		if s, ok := val.(string); ok && s == "" {
+		if s, ok := val.(string); ok && strings.TrimSpace(s) == "" {
 			return errors.NewEnforcerInvalidRequestError(
 				fmt.Sprintf("parameter at index %d is empty string", i))
 		}
@@ -2117,11 +2117,48 @@ func (e *Enforcer) buildRequest(rvals ...interface{}) map[string]interface{} {
 	request := make(map[string]interface{}, len(tokens))
 	for i, token := range tokens {
 		if i < len(rvals) {
-			request[token] = rvals[i]
+			request[token] = normalizeRequestValue(token, rvals[i])
 		}
 	}
 
 	return request
+}
+
+// normalizeRequestValue 规范请求参数值，根据 token 类型进行转换
+func normalizeRequestValue(token string, value interface{}) interface{} {
+	s, ok := value.(string)
+	if !ok {
+		return value
+	}
+	s = strings.TrimSpace(s)
+	switch {
+	case strings.HasSuffix(token, ".obj"):
+		return normalizeKeyMatchPath(s, false)
+	case strings.HasSuffix(token, ".act"):
+		return normalizeHTTPAction(s)
+	default:
+		return s
+	}
+}
+
+// normalizeHTTPAction 规范 HTTP 动作，确保为大写
+// 例如：GET → GET
+// 例如：post → POST
+// 例如：put → PUT
+// 例如：PATCH → PATCH
+// 例如：delete → DELETE
+// 例如：head → HEAD
+// 例如：options → OPTIONS
+// 例如：connect → CONNECT
+// 例如：trace → TRACE
+// 例如：其他 → 其他
+func normalizeHTTPAction(action string) string {
+	switch strings.ToUpper(action) {
+	case "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE":
+		return strings.ToUpper(action)
+	default:
+		return action
+	}
 }
 
 // getRequestTokens 获取 r 段的 token 列表

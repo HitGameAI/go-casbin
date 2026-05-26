@@ -89,7 +89,11 @@ func TestKeyMatch3(t *testing.T) {
 		{"/foo/bar", "/foo/{bar}", true},
 		{"/foo/bar/baz", "/foo/{bar}/baz", true},
 		{"/foo/bar", "/foo/*", true},
+		{"/foo/bar/", "/foo/bar", true},
+		{"/foo/bar/?page=1", "/foo/bar", true},
+		{"/foo/bar/", "/foo/*", true},
 		{"/foo/bar/baz", "/foo/{bar}", false},
+		{"version.view", "version.view/", false},
 	}
 
 	for _, tt := range tests {

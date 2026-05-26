@@ -67,6 +67,44 @@ m = keyMatch3(r.obj, p.obj)
 	assert.False(t, ok, "keyMatch3 should not match unrelated path")
 }
 
+func TestEnforceNormalizesHTTPRequestValues(t *testing.T) {
+	modelText := `
+[request_definition]
+r = sub, dom, obj, act
+
+[policy_definition]
+p = sub, dom, obj, act
+
+[role_definition]
+g = _, _, _
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = g(r.sub, p.sub, r.dom) && keyMatch3(r.obj, p.obj) && r.act == p.act
+`
+	memAdapter := policy.NewMemoryAdapter()
+	err := memAdapter.SavePolicy([]string{
+		"p, role:admin, ops, /v1/versions, POST",
+		"g, user001, role:admin, ops",
+	})
+	require.NoError(t, err)
+
+	e, err := NewEnforcer(
+		WithModelText(modelText),
+		WithAdapter(memAdapter),
+		WithAutoSave(true),
+		WithEnabled(true),
+	)
+	require.NoError(t, err)
+	defer e.Close()
+
+	ok, err := e.Enforce(" user001 ", " ops ", " /v1/versions/?page=1 ", " POST ")
+	assert.NoError(t, err)
+	assert.True(t, ok, "HTTP path/action request values should be normalized inside enforcer")
+}
+
 func TestKeyMatch3WithRoleInheritance(t *testing.T) {
 	modelText := `
 [request_definition]
