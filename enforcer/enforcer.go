@@ -625,7 +625,11 @@ func (e *Enforcer) RemoveFilteredPolicy(fieldIndex int, fieldValues ...string) e
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.invalidateExtraPoliciesCache()
-	return e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, "p", fieldIndex, fieldValues...)
+	if err := e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, "p", fieldIndex, fieldValues...); err != nil {
+		return err
+	}
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "p", nil, nil)
+	return nil
 }
 
 // RemoveNamedPolicy 删除指定类型的策略规则
@@ -646,14 +650,22 @@ func (e *Enforcer) RemoveNamedPolicy(ptype string, params ...string) error {
 func (e *Enforcer) RemoveNamedPolicies(ptype string, rules [][]string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.policy.RemovePolicies(model.SectionPolicyDefinition, ptype, rules)
+	if err := e.policy.RemovePolicies(model.SectionPolicyDefinition, ptype, rules); err != nil {
+		return err
+	}
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, ptype, nil, nil)
+	return nil
 }
 
 // RemoveFilteredNamedPolicy 按字段过滤删除指定类型的策略规则
 func (e *Enforcer) RemoveFilteredNamedPolicy(ptype string, fieldIndex int, fieldValues ...string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, ptype, fieldIndex, fieldValues...)
+	if err := e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, ptype, fieldIndex, fieldValues...); err != nil {
+		return err
+	}
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, ptype, nil, nil)
+	return nil
 }
 
 // UpdatePolicy 更新一条策略规则
@@ -661,7 +673,11 @@ func (e *Enforcer) UpdatePolicy(oldPolicy, newPolicy []string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.invalidateExtraPoliciesCache()
-	return e.policy.UpdatePolicy(model.SectionPolicyDefinition, "p", oldPolicy, newPolicy)
+	if err := e.policy.UpdatePolicy(model.SectionPolicyDefinition, "p", oldPolicy, newPolicy); err != nil {
+		return err
+	}
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, "p", nil, nil)
+	return nil
 }
 
 // UpdatePolicies 批量更新策略规则
@@ -669,7 +685,11 @@ func (e *Enforcer) UpdatePolicies(oldPolicies, newPolicies [][]string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.invalidateExtraPoliciesCache()
-	return e.policy.UpdatePolicies(model.SectionPolicyDefinition, "p", oldPolicies, newPolicies)
+	if err := e.policy.UpdatePolicies(model.SectionPolicyDefinition, "p", oldPolicies, newPolicies); err != nil {
+		return err
+	}
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, "p", nil, nil)
+	return nil
 }
 
 // UpdateFilteredPolicies 按过滤条件更新策略规则
@@ -684,7 +704,12 @@ func (e *Enforcer) UpdateFilteredPolicies(newPolicies [][]string, fieldIndex int
 	}
 
 	e.invalidateExtraPoliciesCache()
-	return e.policy.UpdateFilteredPolicies(model.SectionPolicyDefinition, "p", newPolicies, fieldIndex, fieldValues...)
+	if err := e.policy.UpdateFilteredPolicies(model.SectionPolicyDefinition, "p", newPolicies, fieldIndex, fieldValues...); err != nil {
+		return err
+	}
+
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, "p", nil, nil)
+	return nil
 }
 
 // ==================== 角色分组策略 API ====================
@@ -884,13 +909,22 @@ func (e *Enforcer) UpdateGroupingPolicy(oldRule, newRule []string) error {
 
 	if e.autoBuildRoleLinks {
 		if len(oldRule) >= 2 {
-			e.roleMgr.DeleteLink(oldRule[0], oldRule[1])
+			domain := make([]string, 0)
+			if len(oldRule) >= 3 {
+				domain = append(domain, oldRule[2])
+			}
+			e.roleMgr.DeleteLink(oldRule[0], oldRule[1], domain...)
 		}
 		if len(newRule) >= 2 {
-			_ = e.roleMgr.AddLink(newRule[0], newRule[1])
+			domain := make([]string, 0)
+			if len(newRule) >= 3 {
+				domain = append(domain, newRule[2])
+			}
+			_ = e.roleMgr.AddLink(newRule[0], newRule[1], domain...)
 		}
 	}
 
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, "g", nil, nil)
 	return nil
 }
 
@@ -906,16 +940,25 @@ func (e *Enforcer) UpdateGroupingPolicies(oldRules, newRules [][]string) error {
 	if e.autoBuildRoleLinks {
 		for _, old := range oldRules {
 			if len(old) >= 2 {
-				e.roleMgr.DeleteLink(old[0], old[1])
+				domain := make([]string, 0)
+				if len(old) >= 3 {
+					domain = append(domain, old[2])
+				}
+				e.roleMgr.DeleteLink(old[0], old[1], domain...)
 			}
 		}
 		for _, newR := range newRules {
 			if len(newR) >= 2 {
-				_ = e.roleMgr.AddLink(newR[0], newR[1])
+				domain := make([]string, 0)
+				if len(newR) >= 3 {
+					domain = append(domain, newR[2])
+				}
+				_ = e.roleMgr.AddLink(newR[0], newR[1], domain...)
 			}
 		}
 	}
 
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, "g", nil, nil)
 	return nil
 }
 
