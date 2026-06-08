@@ -93,6 +93,7 @@ type Enforcer struct {
 	matcherExpr     string                    // 缓存 matcher 表达式（模型加载后不变）
 	requestTokens   []string                  // 缓存请求 token 列表（r 段定义，模型加载后不变）
 	shortCircuit    bool                      // 缓存短路优化标志（effect 表达式不变时结果不变）
+	normalizeHost   func(string) string       // 自定义域名归一化函数（默认不处理）
 }
 
 // NewEnforcer 创建核心执行器
@@ -132,6 +133,7 @@ func NewEnforcer(opts ...Option) (*Enforcer, error) {
 		customFuncs:        make(map[string]BuiltinFunc),
 		publicPolicies:     o.publicPolicies,
 		authSkipPolicies:   o.authSkipPolicies,
+		normalizeHost:      o.normalizeHost,
 	}
 
 	e.registerBuiltinFunctions()
@@ -1737,6 +1739,15 @@ func (e *Enforcer) IsEnabled() bool {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.enabled
+}
+
+// NormalizeHost 使用自定义归一化函数处理域名
+// 如果未设置自定义函数，直接返回原始值
+func (e *Enforcer) NormalizeHost(host string) string {
+	if e.normalizeHost != nil {
+		return e.normalizeHost(host)
+	}
+	return host
 }
 
 // IsAutoSave 检查是否启用自动保存

@@ -37,6 +37,7 @@ type Options struct {
 	watchInterval    time.Duration         // 文件变更监控间隔
 	publicPolicies   [][]string            // 公开接口策略（允许匿名访问的路径，不持久化到适配器）
 	authSkipPolicies [][]string            // 认证免鉴权策略（需 JWT 但跳过 Casbin 的路径，不持久化到适配器）
+	normalizeHost    func(string) string   // 自定义域名归一化函数（默认不处理）
 }
 
 // defaultOptions 返回默认配置
@@ -206,6 +207,22 @@ func WithPublicPolicies(policies [][]string) Option {
 func WithAuthSkipPolicies(policies [][]string) Option {
 	return func(o *Options) {
 		o.authSkipPolicies = prependSubject(SubjectAuthenticated, policies)
+	}
+}
+
+// WithNormalizeHost 设置自定义域名归一化函数
+// 用于域名身份校验场景，对 Host 进行归一化处理（如去端口、小写、去尾点号等）
+// 默认不处理（直接返回原始值），业务方可按需传入自定义实现
+//
+// 使用示例：
+//
+//	e, _ := enforcer.NewEnforcer(
+//	    enforcer.WithModelText(rbacModel),
+//	    enforcer.WithNormalizeHost(myNormalizeFunc),
+//	)
+func WithNormalizeHost(fn func(string) string) Option {
+	return func(o *Options) {
+		o.normalizeHost = fn
 	}
 }
 
