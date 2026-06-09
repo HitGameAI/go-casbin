@@ -383,7 +383,7 @@ func (e *Enforcer) doEnforceWithMatcher(ctx context.Context, matcherExpr string,
 
 	policyAssertion := e.getPolicyAssertion()
 	if policyAssertion == nil {
-		return false, errors.NewPolicyNotFoundError("p")
+		return false, errors.NewPolicyNotFoundError(policy.PTypePolicy)
 	}
 
 	mc := &MatchContext{
@@ -394,8 +394,8 @@ func (e *Enforcer) doEnforceWithMatcher(ctx context.Context, matcherExpr string,
 		CustomFuncs:   e.customFuncs,
 		ExtraPolicies: e.getExtraPolicies(),
 		ShortCircuit:  e.shortCircuit,
-		HasEval:       strings.Contains(expr, "eval("),
-		HasGFunc:      strings.Contains(expr, "g("),
+		HasEval:       strings.Contains(expr, policy.EvalFunc),
+		HasGFunc:      strings.Contains(expr, policy.GFunc),
 	}
 
 	matched, matchedEffects, err := e.matcher.Match(mc, expr)
@@ -442,7 +442,7 @@ func (e *Enforcer) enforceExWithMatcherExpr(matcherExpr string, rvals ...interfa
 
 	policyAssertion := e.getPolicyAssertion()
 	if policyAssertion == nil {
-		return false, nil, errors.NewPolicyNotFoundError("p")
+		return false, nil, errors.NewPolicyNotFoundError(policy.PTypePolicy)
 	}
 
 	mc := &MatchContext{
@@ -453,8 +453,8 @@ func (e *Enforcer) enforceExWithMatcherExpr(matcherExpr string, rvals ...interfa
 		CustomFuncs:   e.customFuncs,
 		ExtraPolicies: e.getExtraPolicies(),
 		ShortCircuit:  e.shortCircuit,
-		HasEval:       strings.Contains(expr, "eval("),
-		HasGFunc:      strings.Contains(expr, "g("),
+		HasEval:       strings.Contains(expr, policy.EvalFunc),
+		HasGFunc:      strings.Contains(expr, policy.GFunc),
 	}
 
 	matched, matchedEffects, err := e.matcher.Match(mc, expr)
@@ -517,17 +517,17 @@ func (e *Enforcer) AddPolicy(params ...string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if err := e.validatePolicyRule(model.SectionPolicyDefinition, "p", params); err != nil {
+	if err := e.validatePolicyRule(model.SectionPolicyDefinition, policy.PTypePolicy, params); err != nil {
 		return err
 	}
 
 	// Policy 层已统一处理内存写入和适配器持久化（含回滚），无需 Enforcer 层重复写入
-	if err := e.policy.AddPolicy(model.SectionPolicyDefinition, "p", params); err != nil {
+	if err := e.policy.AddPolicy(model.SectionPolicyDefinition, policy.PTypePolicy, params); err != nil {
 		return err
 	}
 
 	e.invalidateExtraPoliciesCache()
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, "p", nil, params)
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypePolicy, nil, params)
 
 	return nil
 }
@@ -538,18 +538,18 @@ func (e *Enforcer) AddPolicies(rules [][]string) error {
 	defer e.mu.Unlock()
 
 	for _, rule := range rules {
-		if err := e.validatePolicyRule(model.SectionPolicyDefinition, "p", rule); err != nil {
+		if err := e.validatePolicyRule(model.SectionPolicyDefinition, policy.PTypePolicy, rule); err != nil {
 			return err
 		}
 	}
 
 	// Policy 层已统一处理内存写入和适配器持久化（含回滚），无需 Enforcer 层重复写入
-	if err := e.policy.AddPolicies(model.SectionPolicyDefinition, "p", rules); err != nil {
+	if err := e.policy.AddPolicies(model.SectionPolicyDefinition, policy.PTypePolicy, rules); err != nil {
 		return err
 	}
 
 	e.invalidateExtraPoliciesCache()
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, "p", nil, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypePolicy, nil, nil)
 
 	return nil
 }
@@ -558,7 +558,12 @@ func (e *Enforcer) AddPolicies(rules [][]string) error {
 func (e *Enforcer) AddPoliciesEx(rules [][]string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.policy.AddPoliciesEx(model.SectionPolicyDefinition, "p", rules)
+	if err := e.policy.AddPoliciesEx(model.SectionPolicyDefinition, policy.PTypePolicy, rules); err != nil {
+		return err
+	}
+	e.invalidateExtraPoliciesCache()
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypePolicy, nil, nil)
+	return nil
 }
 
 // AddNamedPolicy 添加指定类型的策略规则
@@ -571,6 +576,7 @@ func (e *Enforcer) AddNamedPolicy(ptype string, params ...string) error {
 		return err
 	}
 
+	e.invalidateExtraPoliciesCache()
 	e.notifyPolicyChange(policy.EventTypePolicyAdded, ptype, nil, params)
 	return nil
 }
@@ -579,14 +585,24 @@ func (e *Enforcer) AddNamedPolicy(ptype string, params ...string) error {
 func (e *Enforcer) AddNamedPolicies(ptype string, rules [][]string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.policy.AddPolicies(model.SectionPolicyDefinition, ptype, rules)
+	if err := e.policy.AddPolicies(model.SectionPolicyDefinition, ptype, rules); err != nil {
+		return err
+	}
+	e.invalidateExtraPoliciesCache()
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, ptype, nil, nil)
+	return nil
 }
 
 // AddNamedPoliciesEx 批量添加指定类型的策略规则（忽略已存在的规则）
 func (e *Enforcer) AddNamedPoliciesEx(ptype string, rules [][]string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.policy.AddPoliciesEx(model.SectionPolicyDefinition, ptype, rules)
+	if err := e.policy.AddPoliciesEx(model.SectionPolicyDefinition, ptype, rules); err != nil {
+		return err
+	}
+	e.invalidateExtraPoliciesCache()
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, ptype, nil, nil)
+	return nil
 }
 
 // RemovePolicy 删除一条策略规则
@@ -595,12 +611,12 @@ func (e *Enforcer) RemovePolicy(params ...string) error {
 	defer e.mu.Unlock()
 
 	// Policy 层已统一处理内存删除和适配器持久化（含回滚），无需 Enforcer 层重复写入
-	if err := e.policy.RemovePolicy(model.SectionPolicyDefinition, "p", params); err != nil {
+	if err := e.policy.RemovePolicy(model.SectionPolicyDefinition, policy.PTypePolicy, params); err != nil {
 		return err
 	}
 
 	e.invalidateExtraPoliciesCache()
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "p", params, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypePolicy, params, nil)
 
 	return nil
 }
@@ -611,12 +627,12 @@ func (e *Enforcer) RemovePolicies(rules [][]string) error {
 	defer e.mu.Unlock()
 
 	// Policy 层已统一处理内存删除和适配器持久化（含回滚），无需 Enforcer 层重复写入
-	if err := e.policy.RemovePolicies(model.SectionPolicyDefinition, "p", rules); err != nil {
+	if err := e.policy.RemovePolicies(model.SectionPolicyDefinition, policy.PTypePolicy, rules); err != nil {
 		return err
 	}
 
 	e.invalidateExtraPoliciesCache()
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "p", nil, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypePolicy, nil, nil)
 
 	return nil
 }
@@ -627,10 +643,10 @@ func (e *Enforcer) RemoveFilteredPolicy(fieldIndex int, fieldValues ...string) e
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.invalidateExtraPoliciesCache()
-	if err := e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, "p", fieldIndex, fieldValues...); err != nil {
+	if err := e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, policy.PTypePolicy, fieldIndex, fieldValues...); err != nil {
 		return err
 	}
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "p", nil, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypePolicy, nil, nil)
 	return nil
 }
 
@@ -644,6 +660,7 @@ func (e *Enforcer) RemoveNamedPolicy(ptype string, params ...string) error {
 		return err
 	}
 
+	e.invalidateExtraPoliciesCache()
 	e.notifyPolicyChange(policy.EventTypePolicyRemoved, ptype, params, nil)
 	return nil
 }
@@ -655,6 +672,7 @@ func (e *Enforcer) RemoveNamedPolicies(ptype string, rules [][]string) error {
 	if err := e.policy.RemovePolicies(model.SectionPolicyDefinition, ptype, rules); err != nil {
 		return err
 	}
+	e.invalidateExtraPoliciesCache()
 	e.notifyPolicyChange(policy.EventTypePolicyRemoved, ptype, nil, nil)
 	return nil
 }
@@ -666,6 +684,7 @@ func (e *Enforcer) RemoveFilteredNamedPolicy(ptype string, fieldIndex int, field
 	if err := e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, ptype, fieldIndex, fieldValues...); err != nil {
 		return err
 	}
+	e.invalidateExtraPoliciesCache()
 	e.notifyPolicyChange(policy.EventTypePolicyRemoved, ptype, nil, nil)
 	return nil
 }
@@ -675,10 +694,10 @@ func (e *Enforcer) UpdatePolicy(oldPolicy, newPolicy []string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.invalidateExtraPoliciesCache()
-	if err := e.policy.UpdatePolicy(model.SectionPolicyDefinition, "p", oldPolicy, newPolicy); err != nil {
+	if err := e.policy.UpdatePolicy(model.SectionPolicyDefinition, policy.PTypePolicy, oldPolicy, newPolicy); err != nil {
 		return err
 	}
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, "p", nil, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypePolicy, nil, nil)
 	return nil
 }
 
@@ -687,10 +706,10 @@ func (e *Enforcer) UpdatePolicies(oldPolicies, newPolicies [][]string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.invalidateExtraPoliciesCache()
-	if err := e.policy.UpdatePolicies(model.SectionPolicyDefinition, "p", oldPolicies, newPolicies); err != nil {
+	if err := e.policy.UpdatePolicies(model.SectionPolicyDefinition, policy.PTypePolicy, oldPolicies, newPolicies); err != nil {
 		return err
 	}
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, "p", nil, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypePolicy, nil, nil)
 	return nil
 }
 
@@ -700,17 +719,17 @@ func (e *Enforcer) UpdateFilteredPolicies(newPolicies [][]string, fieldIndex int
 	defer e.mu.Unlock()
 
 	for _, rule := range newPolicies {
-		if err := e.validatePolicyRule(model.SectionPolicyDefinition, "p", rule); err != nil {
+		if err := e.validatePolicyRule(model.SectionPolicyDefinition, policy.PTypePolicy, rule); err != nil {
 			return err
 		}
 	}
 
 	e.invalidateExtraPoliciesCache()
-	if err := e.policy.UpdateFilteredPolicies(model.SectionPolicyDefinition, "p", newPolicies, fieldIndex, fieldValues...); err != nil {
+	if err := e.policy.UpdateFilteredPolicies(model.SectionPolicyDefinition, policy.PTypePolicy, newPolicies, fieldIndex, fieldValues...); err != nil {
 		return err
 	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, "p", nil, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypePolicy, nil, nil)
 	return nil
 }
 
@@ -722,7 +741,7 @@ func (e *Enforcer) AddGroupingPolicy(params ...string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if err := e.policy.AddPolicy(model.SectionRoleDefinition, "g", params); err != nil {
+	if err := e.policy.AddPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, params); err != nil {
 		return err
 	}
 
@@ -736,7 +755,7 @@ func (e *Enforcer) AddGroupingPolicy(params ...string) error {
 		}
 	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, "g", nil, params)
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, params)
 
 	return nil
 }
@@ -746,7 +765,7 @@ func (e *Enforcer) AddGroupingPolicies(rules [][]string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if err := e.policy.AddPolicies(model.SectionRoleDefinition, "g", rules); err != nil {
+	if err := e.policy.AddPolicies(model.SectionRoleDefinition, policy.PTypeGrouping, rules); err != nil {
 		return err
 	}
 
@@ -762,7 +781,7 @@ func (e *Enforcer) AddGroupingPolicies(rules [][]string) error {
 		}
 	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, "g", nil, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, nil)
 
 	return nil
 }
@@ -771,7 +790,22 @@ func (e *Enforcer) AddGroupingPolicies(rules [][]string) error {
 func (e *Enforcer) AddGroupingPoliciesEx(rules [][]string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.policy.AddPoliciesEx(model.SectionRoleDefinition, "g", rules)
+	if err := e.policy.AddPoliciesEx(model.SectionRoleDefinition, policy.PTypeGrouping, rules); err != nil {
+		return err
+	}
+	if e.autoBuildRoleLinks {
+		for _, rule := range rules {
+			if len(rule) >= 2 {
+				domain := make([]string, 0)
+				if len(rule) >= 3 {
+					domain = append(domain, rule[2])
+				}
+				_ = e.roleMgr.AddLink(rule[0], rule[1], domain...)
+			}
+		}
+	}
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, nil)
+	return nil
 }
 
 // RemoveGroupingPolicy 删除角色分组策略
@@ -780,7 +814,7 @@ func (e *Enforcer) RemoveGroupingPolicy(params ...string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if err := e.policy.RemovePolicy(model.SectionRoleDefinition, "g", params); err != nil {
+	if err := e.policy.RemovePolicy(model.SectionRoleDefinition, policy.PTypeGrouping, params); err != nil {
 		return err
 	}
 
@@ -799,7 +833,7 @@ func (e *Enforcer) RemoveGroupingPolicy(params ...string) error {
 		}
 	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", params, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, params, nil)
 
 	return nil
 }
@@ -809,7 +843,7 @@ func (e *Enforcer) RemoveGroupingPolicies(rules [][]string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if err := e.policy.RemovePolicies(model.SectionRoleDefinition, "g", rules); err != nil {
+	if err := e.policy.RemovePolicies(model.SectionRoleDefinition, policy.PTypeGrouping, rules); err != nil {
 		return err
 	}
 
@@ -837,7 +871,7 @@ func (e *Enforcer) RemoveGroupingPolicies(rules [][]string) error {
 		}
 	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", nil, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
 
 	return nil
 }
@@ -848,9 +882,9 @@ func (e *Enforcer) RemoveFilteredGroupingPolicy(fieldIndex int, fieldValues ...s
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	removed := e.policy.GetFilteredPolicy("g", fieldIndex, fieldValues...)
+	removed := e.policy.GetFilteredPolicy(policy.PTypeGrouping, fieldIndex, fieldValues...)
 
-	if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", fieldIndex, fieldValues...); err != nil {
+	if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, fieldIndex, fieldValues...); err != nil {
 		return err
 	}
 
@@ -866,7 +900,7 @@ func (e *Enforcer) RemoveFilteredGroupingPolicy(fieldIndex int, fieldValues ...s
 		}
 	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", nil, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
 
 	return nil
 }
@@ -887,6 +921,7 @@ func (e *Enforcer) ClearAllPolicies() error {
 
 	e.model.ClearPolicies()
 	e.roleMgr.Clear()
+	e.invalidateExtraPoliciesCache()
 
 	if e.autoSave && e.policy.GetAdapter() != nil {
 		if err := e.policy.GetAdapter().SavePolicy(nil); err != nil {
@@ -894,8 +929,8 @@ func (e *Enforcer) ClearAllPolicies() error {
 		}
 	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "p", nil, nil)
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", nil, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypePolicy, nil, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
 
 	return nil
 }
@@ -905,7 +940,7 @@ func (e *Enforcer) UpdateGroupingPolicy(oldRule, newRule []string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if err := e.policy.UpdatePolicy(model.SectionRoleDefinition, "g", oldRule, newRule); err != nil {
+	if err := e.policy.UpdatePolicy(model.SectionRoleDefinition, policy.PTypeGrouping, oldRule, newRule); err != nil {
 		return err
 	}
 
@@ -926,7 +961,7 @@ func (e *Enforcer) UpdateGroupingPolicy(oldRule, newRule []string) error {
 		}
 	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, "g", nil, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, nil)
 	return nil
 }
 
@@ -935,7 +970,7 @@ func (e *Enforcer) UpdateGroupingPolicies(oldRules, newRules [][]string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if err := e.policy.UpdatePolicies(model.SectionRoleDefinition, "g", oldRules, newRules); err != nil {
+	if err := e.policy.UpdatePolicies(model.SectionRoleDefinition, policy.PTypeGrouping, oldRules, newRules); err != nil {
 		return err
 	}
 
@@ -960,7 +995,7 @@ func (e *Enforcer) UpdateGroupingPolicies(oldRules, newRules [][]string) error {
 		}
 	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, "g", nil, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, nil)
 	return nil
 }
 
@@ -1001,7 +1036,7 @@ func (e *Enforcer) AddRoleForUser(user, roleName string, domain ...string) error
 		}
 	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, "g", nil, []string{user, roleName})
+	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, []string{user, roleName})
 
 	return nil
 }
@@ -1023,7 +1058,7 @@ func (e *Enforcer) DeleteRoleForUser(user, roleName string, domain ...string) er
 		}
 	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", []string{user, roleName}, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, []string{user, roleName}, nil)
 
 	return nil
 }
@@ -1044,12 +1079,12 @@ func (e *Enforcer) DeleteRolesForUser(user string, domain ...string) error {
 	}
 
 	if e.autoSave && e.policy.GetAdapter() != nil {
-		if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 0, user); err != nil {
+		if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, 0, user); err != nil {
 			e.logger.WarnKV("Failed to remove filtered grouping policy", "user", user, "error", err.Error())
 		}
 	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", []string{user}, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, []string{user}, nil)
 
 	return nil
 }
@@ -1059,7 +1094,7 @@ func (e *Enforcer) DeleteUser(user string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	existingGrouping := e.policy.GetFilteredPolicy("g", 0, user)
+	existingGrouping := e.policy.GetFilteredPolicy(policy.PTypeGrouping, 0, user)
 	for _, rule := range existingGrouping {
 		if len(rule) >= 2 {
 			domain := make([]string, 0)
@@ -1070,7 +1105,7 @@ func (e *Enforcer) DeleteUser(user string) error {
 		}
 	}
 
-	return e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 0, user)
+	return e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, 0, user)
 }
 
 // DeleteRole 删除角色及其所有用户关系
@@ -1078,7 +1113,7 @@ func (e *Enforcer) DeleteRole(roleName string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	existingGrouping := e.policy.GetFilteredPolicy("g", 1, roleName)
+	existingGrouping := e.policy.GetFilteredPolicy(policy.PTypeGrouping, 1, roleName)
 	for _, rule := range existingGrouping {
 		if len(rule) >= 2 {
 			domain := make([]string, 0)
@@ -1089,7 +1124,7 @@ func (e *Enforcer) DeleteRole(roleName string) error {
 		}
 	}
 
-	return e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 1, roleName)
+	return e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, 1, roleName)
 }
 
 // GetImplicitRolesForUser 获取用户的隐式角色（包含继承链上的所有角色）
@@ -1106,7 +1141,7 @@ func (e *Enforcer) GetImplicitPermissionsForUser(user string, domain ...string) 
 	seen := make(map[string]bool)
 
 	for _, r := range roles {
-		policies := e.policy.GetFilteredPolicy("p", 0, r)
+		policies := e.policy.GetFilteredPolicy(policy.PTypePolicy, 0, r)
 		for _, p := range policies {
 			key := strings.Join(p, ",")
 			if !seen[key] {
@@ -1121,7 +1156,7 @@ func (e *Enforcer) GetImplicitPermissionsForUser(user string, domain ...string) 
 
 // GetImplicitUsersForPermission 获取拥有指定权限的所有隐式用户
 func (e *Enforcer) GetImplicitUsersForPermission(permission ...string) []string {
-	policies := e.policy.GetFilteredPolicy("p", 1, permission...)
+	policies := e.policy.GetFilteredPolicy(policy.PTypePolicy, 1, permission...)
 
 	var users []string
 	seen := make(map[string]bool)
@@ -1146,12 +1181,12 @@ func (e *Enforcer) GetImplicitUsersForPermission(permission ...string) []string 
 
 // GetPermissionsForUser 获取用户的直接权限
 func (e *Enforcer) GetPermissionsForUser(user string, domain ...string) [][]string {
-	return e.policy.GetFilteredPolicy("p", 0, user)
+	return e.policy.GetFilteredPolicy(policy.PTypePolicy, 0, user)
 }
 
 // HasPermissionForUser 判断用户是否拥有指定权限
 func (e *Enforcer) HasPermissionForUser(user string, permission ...string) bool {
-	return e.policy.HasPolicy("p", append([]string{user}, permission...))
+	return e.policy.HasPolicy(policy.PTypePolicy, append([]string{user}, permission...))
 }
 
 // AddPermissionForUser 为用户添加单条权限
@@ -1221,7 +1256,7 @@ func (e *Enforcer) GetPermissionsForUserInDomain(user, domain string) [][]string
 
 	var result [][]string
 	for _, subject := range allSubjects {
-		policies := e.policy.GetFilteredPolicy("p", 0, subject, domain)
+		policies := e.policy.GetFilteredPolicy(policy.PTypePolicy, 0, subject, domain)
 		result = append(result, policies...)
 	}
 	return result
@@ -1257,12 +1292,12 @@ func (e *Enforcer) DeleteAllUsersByDomain(domain string) error {
 	e.roleMgr.DeleteDomain(domain)
 
 	if e.autoSave && e.policy.GetAdapter() != nil {
-		if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 2, domain); err != nil {
+		if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, 2, domain); err != nil {
 			e.logger.WarnKV("Failed to remove filtered grouping policy by domain", "domain", domain, "error", err.Error())
 		}
 	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", nil, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
 
 	return nil
 }
@@ -1279,13 +1314,13 @@ func (e *Enforcer) DeleteDomains(domains ...string) error {
 
 	if e.autoSave && e.policy.GetAdapter() != nil {
 		for _, d := range domains {
-			if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 2, d); err != nil {
+			if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, 2, d); err != nil {
 				e.logger.WarnKV("Failed to remove filtered grouping policy by domain", "domain", d, "error", err.Error())
 			}
 		}
 	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", nil, nil)
+	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
 
 	return nil
 }
@@ -1334,7 +1369,7 @@ func (e *Enforcer) ExecuteInTransaction(ctx context.Context, fn func() error) er
 // groupingRules 每个元素格式为 [user, roleName, domain]
 func (e *Enforcer) TransactionalSyncUserRoles(ctx context.Context, user string, groupingRules [][]string) error {
 	return e.ExecuteInTransaction(ctx, func() error {
-		existingGrouping := e.policy.GetFilteredPolicy("g", 0, user)
+		existingGrouping := e.policy.GetFilteredPolicy(policy.PTypeGrouping, 0, user)
 		if len(existingGrouping) > 0 {
 			for _, rule := range existingGrouping {
 				if len(rule) >= 2 {
@@ -1345,13 +1380,13 @@ func (e *Enforcer) TransactionalSyncUserRoles(ctx context.Context, user string, 
 					e.roleMgr.DeleteLink(rule[0], rule[1], domain...)
 				}
 			}
-			if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 0, user); err != nil {
+			if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, 0, user); err != nil {
 				return err
 			}
 		}
 
 		if len(groupingRules) > 0 {
-			if err := e.policy.AddPolicies(model.SectionRoleDefinition, "g", groupingRules); err != nil {
+			if err := e.policy.AddPolicies(model.SectionRoleDefinition, policy.PTypeGrouping, groupingRules); err != nil {
 				return err
 			}
 
@@ -1369,7 +1404,7 @@ func (e *Enforcer) TransactionalSyncUserRoles(ctx context.Context, user string, 
 
 		}
 
-		e.notifyPolicyChange(policy.EventTypePolicyAdded, "g", nil, nil)
+		e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, nil)
 
 		return nil
 	})
@@ -1379,9 +1414,9 @@ func (e *Enforcer) TransactionalSyncUserRoles(ctx context.Context, user string, 
 // 同时清理 p 段策略、g 段策略、角色管理器和适配器
 func (e *Enforcer) TransactionalDeleteUser(ctx context.Context, user string) error {
 	return e.ExecuteInTransaction(ctx, func() error {
-		_ = e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, "p", 0, user)
+		_ = e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, policy.PTypePolicy, 0, user)
 
-		existingGrouping := e.policy.GetFilteredPolicy("g", 0, user)
+		existingGrouping := e.policy.GetFilteredPolicy(policy.PTypeGrouping, 0, user)
 		for _, rule := range existingGrouping {
 			if len(rule) >= 2 {
 				domain := make([]string, 0)
@@ -1391,10 +1426,10 @@ func (e *Enforcer) TransactionalDeleteUser(ctx context.Context, user string) err
 				e.roleMgr.DeleteLink(rule[0], rule[1], domain...)
 			}
 		}
-		_ = e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 0, user)
+		_ = e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, 0, user)
 
-		e.notifyPolicyChange(policy.EventTypePolicyRemoved, "p", nil, nil)
-		e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", nil, nil)
+		e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypePolicy, nil, nil)
+		e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
 
 		return nil
 	})
@@ -1409,11 +1444,11 @@ func (e *Enforcer) TransactionalDeleteRole(ctx context.Context, roleName string)
 			e.roleMgr.DeleteLink(u, roleName)
 		}
 
-		_ = e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, "g", 1, roleName)
-		_ = e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, "p", 0, roleName)
+		_ = e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, 1, roleName)
+		_ = e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, policy.PTypePolicy, 0, roleName)
 
-		e.notifyPolicyChange(policy.EventTypePolicyRemoved, "p", nil, nil)
-		e.notifyPolicyChange(policy.EventTypePolicyRemoved, "g", nil, nil)
+		e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypePolicy, nil, nil)
+		e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
 
 		return nil
 	})
@@ -1505,13 +1540,13 @@ func (e *Enforcer) GetAllUsers() []string {
 
 // GetPolicy 获取 p 段的所有策略
 func (e *Enforcer) GetPolicy() [][]string {
-	return e.policy.GetAllPolicies("p")
+	return e.policy.GetAllPolicies(policy.PTypePolicy)
 }
 
 // GetFilteredPolicy 获取 p 段的过滤策略
 // fieldIndex: 起始字段索引，fieldValues: 过滤值
 func (e *Enforcer) GetFilteredPolicy(fieldIndex int, fieldValues ...string) [][]string {
-	return e.policy.GetFilteredPolicy("p", fieldIndex, fieldValues...)
+	return e.policy.GetFilteredPolicy(policy.PTypePolicy, fieldIndex, fieldValues...)
 }
 
 // GetNamedPolicy 获取指定策略类型的所有策略
@@ -1526,12 +1561,12 @@ func (e *Enforcer) GetFilteredNamedPolicy(ptype string, fieldIndex int, fieldVal
 
 // GetGroupingPolicy 获取 g 段的所有角色分组策略
 func (e *Enforcer) GetGroupingPolicy() [][]string {
-	return e.policy.GetAllPolicies("g")
+	return e.policy.GetAllPolicies(policy.PTypeGrouping)
 }
 
 // GetFilteredGroupingPolicy 获取 g 段的过滤分组策略
 func (e *Enforcer) GetFilteredGroupingPolicy(fieldIndex int, fieldValues ...string) [][]string {
-	return e.policy.GetFilteredPolicy("g", fieldIndex, fieldValues...)
+	return e.policy.GetFilteredPolicy(policy.PTypeGrouping, fieldIndex, fieldValues...)
 }
 
 // GetNamedGroupingPolicy 获取指定策略类型的所有分组策略
@@ -1551,12 +1586,12 @@ func (e *Enforcer) HasNamedPolicy(ptype string, params ...string) bool {
 
 // HasPolicy 判断 p 段中是否存在某条策略
 func (e *Enforcer) HasPolicy(params ...string) bool {
-	return e.policy.HasPolicy("p", params)
+	return e.policy.HasPolicy(policy.PTypePolicy, params)
 }
 
 // HasGroupingPolicy 判断 g 段中是否存在某条分组策略
 func (e *Enforcer) HasGroupingPolicy(params ...string) bool {
-	return e.policy.HasPolicy("g", params)
+	return e.policy.HasPolicy(policy.PTypeGrouping, params)
 }
 
 // HasNamedGroupingPolicy 判断指定策略类型中是否存在某条分组策略
@@ -1824,6 +1859,7 @@ func (e *Enforcer) ClearPolicy() {
 	defer e.mu.Unlock()
 	e.model.ClearPolicies()
 	e.policy.GetCache().InvalidateAll()
+	e.invalidateExtraPoliciesCache()
 }
 
 // LoadPolicy 从适配器加载策略
@@ -1850,6 +1886,7 @@ func (e *Enforcer) LoadPolicy() error {
 		e.loadRoleLinks()
 	}
 
+	e.invalidateExtraPoliciesCache()
 	return nil
 }
 
@@ -1868,6 +1905,7 @@ func (e *Enforcer) LoadFilteredPolicy(filter interface{}) error {
 		e.loadRoleLinks()
 	}
 
+	e.invalidateExtraPoliciesCache()
 	return nil
 }
 
@@ -1933,7 +1971,7 @@ func (e *Enforcer) reloadPublicPoliciesUnlocked() {
 	// 临时移除适配器，确保公开策略仅添加到模型内存，不持久化
 	prevAdapter := e.policy.GetAdapter()
 	e.policy.SetAdapter(nil)
-	if err := e.policy.AddPoliciesEx(model.SectionPolicyDefinition, "p", e.publicPolicies); err != nil {
+	if err := e.policy.AddPoliciesEx(model.SectionPolicyDefinition, policy.PTypePolicy, e.publicPolicies); err != nil {
 		e.logger.WarnKV("Failed to reload public policies", "error", err.Error())
 	}
 	e.policy.SetAdapter(prevAdapter)
@@ -1949,7 +1987,7 @@ func (e *Enforcer) reloadAuthSkipPoliciesUnlocked() {
 	// 临时移除适配器，确保认证免鉴权策略仅添加到模型内存，不持久化
 	prevAdapter := e.policy.GetAdapter()
 	e.policy.SetAdapter(nil)
-	if err := e.policy.AddPoliciesEx(model.SectionPolicyDefinition, "p", e.authSkipPolicies); err != nil {
+	if err := e.policy.AddPoliciesEx(model.SectionPolicyDefinition, policy.PTypePolicy, e.authSkipPolicies); err != nil {
 		e.logger.WarnKV("Failed to reload auth-skip policies", "error", err.Error())
 	}
 	e.policy.SetAdapter(prevAdapter)
@@ -2007,7 +2045,7 @@ func (e *Enforcer) doEnforce(ctx context.Context, rvals ...interface{}) (bool, e
 
 	policyAssertion := e.getPolicyAssertion()
 	if policyAssertion == nil {
-		return false, errors.NewPolicyNotFoundError("p")
+		return false, errors.NewPolicyNotFoundError(policy.PTypePolicy)
 	}
 
 	mc := &MatchContext{
@@ -2016,10 +2054,10 @@ func (e *Enforcer) doEnforce(ctx context.Context, rvals ...interface{}) (bool, e
 		RoleMgr:       e.roleMgr,
 		Assertion:     policyAssertion,
 		CustomFuncs:   e.customFuncs,
-		ExtraPolicies: e.getExtraPolicies(),                   // 使用缓存的 extraPolicies
-		ShortCircuit:  e.shortCircuit,                         // 短路优化：some(where(p.eft==allow)) 模式下匹配到即返回
-		HasEval:       strings.Contains(matcherExpr, "eval("), // 预计算，避免每条策略重复扫描
-		HasGFunc:      strings.Contains(matcherExpr, "g("),    // 预计算，避免每条策略重复扫描
+		ExtraPolicies: e.getExtraPolicies(),                           // 使用缓存的 extraPolicies
+		ShortCircuit:  e.shortCircuit,                                 // 短路优化：some(where(p.eft==allow)) 模式下匹配到即返回
+		HasEval:       strings.Contains(matcherExpr, policy.EvalFunc), // 预计算，避免每条策略重复扫描
+		HasGFunc:      strings.Contains(matcherExpr, policy.GFunc),    // 预计算，避免每条策略重复扫描
 	}
 
 	matched, matchedEffects, err := e.matcher.Match(mc, matcherExpr)
@@ -2066,7 +2104,7 @@ func (e *Enforcer) initCachedFields() {
 	e.shortCircuit = e.computeShortCircuit()
 
 	// 初始化 extraPolicies 缓存
-	e.extraPolicies = e.buildExtraPolicies("p")
+	e.extraPolicies = e.buildExtraPolicies(policy.PTypePolicy)
 }
 
 // invalidateExtraPoliciesCache 使 extraPolicies 缓存失效
@@ -2078,7 +2116,7 @@ func (e *Enforcer) invalidateExtraPoliciesCache() {
 // getExtraPolicies 获取 extraPolicies（带懒加载缓存）
 func (e *Enforcer) getExtraPolicies() map[string]*PolicySegment {
 	if e.extraPolicies == nil {
-		e.extraPolicies = e.buildExtraPolicies("p")
+		e.extraPolicies = e.buildExtraPolicies(policy.PTypePolicy)
 	}
 	return e.extraPolicies
 }
@@ -2139,7 +2177,7 @@ func (e *Enforcer) validatePolicyRule(sec, ptype string, rule []string) error {
 
 	if policyAssertion != nil {
 		expectedLen := len(policyAssertion.Tokens)
-		if ptype != "p" && ptype != "" {
+		if ptype != policy.PTypePolicy && ptype != "" {
 			// 对于 g 段等其他策略段，不强制校验字段数量
 			expectedLen = -1
 		}
@@ -2245,8 +2283,8 @@ func (e *Enforcer) getMatcherExpression() string {
 
 // getPolicyAssertion 获取 p 段的策略断言
 func (e *Enforcer) getPolicyAssertion() *model.Assertion {
-	// 精确匹配 key="p"，避免匹配到 p2、p3 等额外策略段
-	if assertion, ok := e.model.GetAssertions()["p"]; ok {
+	// 精确匹配 key=policy.PTypePolicy，避免匹配到 p2、p3 等额外策略段
+	if assertion, ok := e.model.GetAssertions()[policy.PTypePolicy]; ok {
 		return assertion
 	}
 	// 回退：遍历查找第一个策略段

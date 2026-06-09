@@ -43,6 +43,12 @@ const (
 	PTypeGrouping2 = "g2" // 角色分组2：用于带域的角色继承（多租户）
 )
 
+// 函数前缀
+const (
+	EvalFunc = "eval(" // 评估函数前缀
+	GFunc    = "g("    // 角色继承组函数前缀
+)
+
 // 语义化字段索引（用于 Domain RBAC）
 // 定义策略参数在数组中的标准位置，便于按语义访问
 const (

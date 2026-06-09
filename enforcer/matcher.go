@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/kamalyes/go-casbin/model"
+	"github.com/kamalyes/go-casbin/policy"
 	"github.com/kamalyes/go-casbin/role"
 	"github.com/kamalyes/go-logger"
 	"github.com/kamalyes/go-toolbox/pkg/safe"
@@ -130,8 +131,10 @@ func (me *MatcherEngine) matchWithExtraPolicies(mc *MatchContext, matcherExpr st
 	leftExpr := strings.TrimSpace(matcherExpr[:topOr])
 	rightExpr := strings.TrimSpace(matcherExpr[topOr+2:])
 
-	leftHasP2 := me.exprReferencesSegment(leftExpr, "p2")
-	rightHasP2 := me.exprReferencesSegment(rightExpr, "p2")
+	leftHasP2 := me.exprReferencesSegment(leftExpr, policy.PTypePolicy2)
+	rightHasP2 := me.exprReferencesSegment(rightExpr, policy.PTypePolicy2)
+
+	me.logger.DebugKV("matchWithExtraPolicies", "leftHasP2", leftHasP2, "rightHasP2", rightHasP2, "leftExpr", leftExpr, "rightExpr", rightExpr)
 
 	if leftHasP2 || rightHasP2 {
 		var rbacExpr, pbacExpr string
@@ -152,18 +155,23 @@ func (me *MatcherEngine) matchWithExtraPolicies(mc *MatchContext, matcherExpr st
 			pbacExpr = rightExpr
 		}
 
-		if p2, ok := mc.ExtraPolicies["p2"]; ok {
+		if p2, ok := mc.ExtraPolicies[policy.PTypePolicy2]; ok {
 			pbacPolicies = p2.Policies
 			pbacAssertion = p2.Assertion
 		}
 
+		me.logger.DebugKV("matchWithExtraPolicies-rbac", "rbacExpr", rbacExpr, "policies_count", len(rbacPolicies))
+		me.logger.DebugKV("matchWithExtraPolicies-pbac", "pbacExpr", pbacExpr, "policies_count", len(pbacPolicies), "pbacPolicies", fmt.Sprintf("%v", pbacPolicies))
+
 		ok, effects, _ := me.matchSingleSegment(mc, rbacExpr, rbacPolicies, rbacAssertion, nil)
+		me.logger.DebugKV("matchWithExtraPolicies-rbac-result", "ok", ok)
 		if ok {
 			matchedEffects = append(matchedEffects, effects...)
 			return true, matchedEffects, nil
 		}
 
 		ok, effects, _ = me.matchSingleSegment(mc, pbacExpr, pbacPolicies, pbacAssertion, nil)
+		me.logger.DebugKV("matchWithExtraPolicies-pbac-result", "ok", ok)
 		if ok {
 			matchedEffects = append(matchedEffects, effects...)
 			return true, matchedEffects, nil

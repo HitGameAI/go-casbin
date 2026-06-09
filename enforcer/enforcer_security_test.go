@@ -1407,3 +1407,138 @@ func TestNewEnforcer_WithBreaker(t *testing.T) {
 	defer e.Close()
 	assert.Equal(t, StateReady, e.GetState())
 }
+
+// ==================== extraPolicies 缓存失效集成测试 ====================
+
+// buildP2ModelEnforcer 创建带 p2 段的 Enforcer（内存模式）
+func buildP2ModelEnforcer(t *testing.T) *Enforcer {
+	t.Helper()
+	modelText := `
+[request_definition]
+r = sub, dom, obj, act
+
+[policy_definition]
+p = sub, dom, obj, act
+
+[policy_definition]
+p2 = sub_rule, dom, obj, act
+
+[role_definition]
+g = _, _, _
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = g(r.sub, p.sub, r.dom) && r.dom == p.dom && r.obj == p.obj && r.act == p.act || eval(p2.sub_rule) && r.dom == p2.dom && r.obj == p2.obj && r.act == p2.act
+`
+	e, err := NewEnforcer(
+		WithModelText(modelText),
+		WithAutoSave(true),
+		WithEnabled(true),
+	)
+	require.NoError(t, err)
+	return e
+}
+
+// TestExtraPoliciesCache_AddNamedPolicy 验证 AddNamedPolicy 后 extraPolicies 缓存正确失效
+func TestExtraPoliciesCache_AddNamedPolicy(t *testing.T) {
+	e := buildP2ModelEnforcer(t)
+	defer e.Close()
+
+	// 添加 p2 策略
+	err := e.AddNamedPolicy("p2", `r.sub != ""`, "tenant::t001", "domain::admin.example.com", "HOST")
+	require.NoError(t, err)
+
+	// enforce 应该匹配到 p2 策略
+	ok, err := e.Enforce("u001", "tenant::t001", "domain::admin.example.com", "HOST")
+	assert.NoError(t, err)
+	assert.True(t, ok, "should match p2 policy after AddNamedPolicy")
+}
+
+// TestExtraPoliciesCache_RemoveNamedPolicy 验证 RemoveNamedPolicy 后 extraPolicies 缓存正确失效
+func TestExtraPoliciesCache_RemoveNamedPolicy(t *testing.T) {
+	e := buildP2ModelEnforcer(t)
+	defer e.Close()
+
+	// 添加然后移除 p2 策略
+	err := e.AddNamedPolicy("p2", `r.sub != ""`, "tenant::t001", "domain::admin.example.com", "HOST")
+	require.NoError(t, err)
+
+	err = e.RemoveNamedPolicy("p2", `r.sub != ""`, "tenant::t001", "domain::admin.example.com", "HOST")
+	require.NoError(t, err)
+
+	// enforce 不应再匹配
+	ok, err := e.Enforce("u001", "tenant::t001", "domain::admin.example.com", "HOST")
+	assert.NoError(t, err)
+	assert.False(t, ok, "should not match p2 policy after RemoveNamedPolicy")
+}
+
+// TestExtraPoliciesCache_AddPoliciesEx 验证 AddPoliciesEx 后 extraPolicies 缓存正确失效
+func TestExtraPoliciesCache_AddPoliciesEx(t *testing.T) {
+	e := buildP2ModelEnforcer(t)
+	defer e.Close()
+
+	// 先添加一条 p2 策略
+	err := e.AddNamedPolicy("p2", `r.sub != ""`, "tenant::t001", "domain::admin.example.com", "HOST")
+	require.NoError(t, err)
+
+	// AddPoliciesEx 忽略已存在的，添加新的
+	err = e.AddPoliciesEx([][]string{
+		{"alice", "ops", "/api/users", "GET"},
+	})
+	require.NoError(t, err)
+
+	// 新策略应可匹配
+	ok, err := e.Enforce("alice", "ops", "/api/users", "GET")
+	assert.NoError(t, err)
+	assert.True(t, ok, "should match p policy after AddPoliciesEx")
+}
+
+// TestExtraPoliciesCache_ClearPolicy 验证 ClearPolicy 后 extraPolicies 缓存正确失效
+func TestExtraPoliciesCache_ClearPolicy(t *testing.T) {
+	e := buildP2ModelEnforcer(t)
+	defer e.Close()
+
+	// 添加 p2 策略
+	err := e.AddNamedPolicy("p2", `r.sub != ""`, "tenant::t001", "domain::admin.example.com", "HOST")
+	require.NoError(t, err)
+
+	ok, err := e.Enforce("u001", "tenant::t001", "domain::admin.example.com", "HOST")
+	require.NoError(t, err)
+	require.True(t, ok, "should match before clear")
+
+	// 清空策略
+	e.ClearPolicy()
+
+	// 不应再匹配
+	ok, err = e.Enforce("u001", "tenant::t001", "domain::admin.example.com", "HOST")
+	assert.NoError(t, err)
+	assert.False(t, ok, "should not match after ClearPolicy")
+}
+
+// TestExtraPoliciesCache_ClearAllPolicies 验证 ClearAllPolicies 后 extraPolicies 缓存正确失效
+func TestExtraPoliciesCache_ClearAllPolicies(t *testing.T) {
+	e := buildP2ModelEnforcer(t)
+	defer e.Close()
+
+	// 添加 p 和 p2 策略
+	err := e.AddPolicy("alice", "ops", "/api/users", "GET")
+	require.NoError(t, err)
+	err = e.AddNamedPolicy("p2", `r.sub != ""`, "tenant::t001", "domain::admin.example.com", "HOST")
+	require.NoError(t, err)
+
+	// 清空所有策略
+	err = e.ClearAllPolicies()
+	require.NoError(t, err)
+
+	// p 策略不应再匹配
+	ok, err := e.Enforce("alice", "ops", "/api/users", "GET")
+	assert.NoError(t, err)
+	assert.False(t, ok, "should not match p policy after ClearAllPolicies")
+
+	// p2 策略也不应再匹配
+	ok, err = e.Enforce("u001", "tenant::t001", "domain::admin.example.com", "HOST")
+	assert.NoError(t, err)
+	assert.False(t, ok, "should not match p2 policy after ClearAllPolicies")
+}
