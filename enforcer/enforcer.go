@@ -1262,6 +1262,54 @@ func (e *Enforcer) GetPermissionsForUserInDomain(user, domain string) [][]string
 	return result
 }
 
+// DomainQuery 多域查询参数
+type DomainQuery struct {
+	Subject string
+	Domain  string
+}
+
+// GetPermissionsInDomains 批量获取多个 (subject, domain) 组合的权限
+// 相比逐个调用 GetFilteredPolicy，此方法只做一次策略全扫描，
+// 按 (subject, domain) 索引匹配，避免 N×M 次线性扫描
+// 返回去重后的 "obj:act" 列表
+func (e *Enforcer) GetPermissionsInDomains(queries []DomainQuery) []string {
+	if len(queries) == 0 {
+		return nil
+	}
+
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	// 构建 (subject, domain) 查找集合
+	lookup := make(map[[2]string]struct{}, len(queries))
+	for _, q := range queries {
+		lookup[[2]string{q.Subject, q.Domain}] = struct{}{}
+	}
+
+	// 一次遍历策略，按 (sub, dom) 匹配
+	policyAssertion := e.getPolicyAssertion()
+	if policyAssertion == nil {
+		return nil
+	}
+
+	permSet := make(map[string]struct{})
+	for _, p := range policyAssertion.Policies {
+		if len(p) < 4 {
+			continue
+		}
+		key := [2]string{p[0], p[1]}
+		if _, ok := lookup[key]; ok {
+			permSet[p[2]+":"+p[3]] = struct{}{}
+		}
+	}
+
+	permissions := make([]string, 0, len(permSet))
+	for p := range permSet {
+		permissions = append(permissions, p)
+	}
+	return permissions
+}
+
 // AddRoleForUserInDomain 在指定域中为用户添加角色
 // 等价于在 g 段添加策略：user, roleName, domain
 func (e *Enforcer) AddRoleForUserInDomain(user, roleName, domain string) error {
@@ -2028,8 +2076,8 @@ func (e *Enforcer) doEnforce(ctx context.Context, rvals ...interface{}) (bool, e
 	})
 
 	// 安全校验：请求参数不能为空，且必须与模型 r 段定义的字段数量匹配
-	if err := e.validateRequest(rvals); err != nil {
-		return false, err
+	if validateErr := e.validateRequest(rvals); validateErr != nil {
+		return false, validateErr
 	}
 
 	request := e.buildRequest(rvals...)

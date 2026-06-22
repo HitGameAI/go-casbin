@@ -165,3 +165,62 @@ func TestRBACDomainFilteredGroupingPolicy(t *testing.T) {
 	roles = e.GetRolesForUserInDomain("alice", "tenant2")
 	assert.NotEmpty(t, roles, "tenant2 roles should remain")
 }
+
+func TestGetPermissionsInDomains(t *testing.T) {
+	e := newTestEnforcer(t, rbacDomainModelPath, rbacDomainPolicyPath)
+
+	// alice 在 tenant1 是 admin，在 tenant2 是 viewer
+	// admin 在 tenant1: data1:read, data1:write
+	// viewer 在 tenant2: data2:read
+	// alice 自身无直接 p 策略，权限全来自角色
+	queries := []DomainQuery{
+		{Subject: "admin", Domain: "tenant1"},
+		{Subject: "viewer", Domain: "tenant2"},
+	}
+	perms := e.GetPermissionsInDomains(queries)
+	assert.NotEmpty(t, perms, "should have permissions")
+	assert.Contains(t, perms, "data1:read", "admin in tenant1 can read data1")
+	assert.Contains(t, perms, "data1:write", "admin in tenant1 can write data1")
+	assert.Contains(t, perms, "data2:read", "viewer in tenant2 can read data2")
+	assert.NotContains(t, perms, "data2:write", "viewer in tenant2 cannot write data2")
+}
+
+func TestGetPermissionsInDomainsEmpty(t *testing.T) {
+	e := newTestEnforcer(t, rbacDomainModelPath, rbacDomainPolicyPath)
+
+	perms := e.GetPermissionsInDomains(nil)
+	assert.Nil(t, perms, "empty queries should return nil")
+}
+
+func TestGetPermissionsInDomainsNoMatch(t *testing.T) {
+	e := newTestEnforcer(t, rbacDomainModelPath, rbacDomainPolicyPath)
+
+	queries := []DomainQuery{
+		{Subject: "unknown_role", Domain: "tenant1"},
+	}
+	perms := e.GetPermissionsInDomains(queries)
+	assert.Empty(t, perms, "no matching subject should return empty")
+}
+
+func TestGetPermissionsInDomainsDedup(t *testing.T) {
+	e := newTestEnforcer(t, rbacDomainModelPath, rbacDomainPolicyPath)
+
+	// admin 在 tenant1 和 tenant2 都有 data2:read（tenant2 的 admin 策略存在）
+	// 重复查询同一 (subject, domain) 应去重
+	queries := []DomainQuery{
+		{Subject: "admin", Domain: "tenant1"},
+		{Subject: "admin", Domain: "tenant2"},
+		{Subject: "admin", Domain: "tenant1"}, // 重复
+	}
+	perms := e.GetPermissionsInDomains(queries)
+	assert.NotEmpty(t, perms, "should have permissions")
+
+	// 验证去重：结果中不应有重复项
+	permSet := make(map[string]int)
+	for _, p := range perms {
+		permSet[p]++
+	}
+	for p, count := range permSet {
+		assert.Equal(t, 1, count, "permission %q should appear only once", p)
+	}
+}

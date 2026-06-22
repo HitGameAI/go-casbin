@@ -252,6 +252,121 @@ func BenchmarkMatcherEngine_Match_ACL(b *testing.B) {
 	}
 }
 
+// ==================== GetPermissionsInDomains 基准测试 ====================
+
+// buildDomainBenchmarkEnforcer 构建多域基准测试 Enforcer
+func buildDomainBenchmarkEnforcer(b *testing.B, domainCount, policiesPerDomain int) *Enforcer {
+	modelText := `
+[request_definition]
+r = sub, dom, obj, act
+
+[policy_definition]
+p = sub, dom, obj, act
+
+[role_definition]
+g = _, _, _
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = g(r.sub, p.sub, r.dom) && r.obj == p.obj && r.act == p.act
+`
+	var policies []string
+	for d := 0; d < domainCount; d++ {
+		domain := fmt.Sprintf("tenant_%03d", d)
+		for p := 0; p < policiesPerDomain; p++ {
+			role := fmt.Sprintf("role_%03d", p)
+			policies = append(policies, fmt.Sprintf("p, %s, %s, resource_%03d, read", role, domain, p))
+			policies = append(policies, fmt.Sprintf("p, %s, %s, resource_%03d, write", role, domain, p))
+		}
+		policies = append(policies, fmt.Sprintf("g, test_user, role_000, %s", domain))
+	}
+
+	memAdapter := policy.NewMemoryAdapter()
+	if err := memAdapter.SavePolicy(policies); err != nil {
+		b.Fatal(err)
+	}
+
+	e, err := NewEnforcer(
+		WithModelText(modelText),
+		WithAdapter(memAdapter),
+		WithAutoSave(false),
+		WithEnabled(true),
+		WithLogger(logger.NoLogger),
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	return e
+}
+
+// BenchmarkGetPermissionsInDomains_Small 小规模（5域×10策略/域）
+func BenchmarkGetPermissionsInDomains_Small(b *testing.B) {
+	e := buildDomainBenchmarkEnforcer(b, 5, 10)
+	defer e.Close()
+
+	queries := make([]DomainQuery, 5)
+	for i := 0; i < 5; i++ {
+		queries[i] = DomainQuery{Subject: "role_000", Domain: fmt.Sprintf("tenant_%03d", i)}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		e.GetPermissionsInDomains(queries)
+	}
+}
+
+// BenchmarkGetPermissionsInDomains_Medium 中等规模（20域×50策略/域）
+func BenchmarkGetPermissionsInDomains_Medium(b *testing.B) {
+	e := buildDomainBenchmarkEnforcer(b, 20, 50)
+	defer e.Close()
+
+	queries := make([]DomainQuery, 20)
+	for i := 0; i < 20; i++ {
+		queries[i] = DomainQuery{Subject: "role_000", Domain: fmt.Sprintf("tenant_%03d", i)}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		e.GetPermissionsInDomains(queries)
+	}
+}
+
+// BenchmarkGetPermissionsInDomains_Large 大规模（50域×100策略/域）
+func BenchmarkGetPermissionsInDomains_Large(b *testing.B) {
+	e := buildDomainBenchmarkEnforcer(b, 50, 100)
+	defer e.Close()
+
+	queries := make([]DomainQuery, 50)
+	for i := 0; i < 50; i++ {
+		queries[i] = DomainQuery{Subject: "role_000", Domain: fmt.Sprintf("tenant_%03d", i)}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		e.GetPermissionsInDomains(queries)
+	}
+}
+
+// BenchmarkGetPermissionsForUserInDomain_Loop 逐域调用旧方法作为对比基准
+func BenchmarkGetPermissionsForUserInDomain_Loop(b *testing.B) {
+	e := buildDomainBenchmarkEnforcer(b, 20, 50)
+	defer e.Close()
+
+	domains := make([]string, 20)
+	for i := 0; i < 20; i++ {
+		domains[i] = fmt.Sprintf("tenant_%03d", i)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, d := range domains {
+			e.GetPermissionsForUserInDomain("role_000", d)
+		}
+	}
+}
+
 // BenchmarkMatcherEngine_Match_ShortCircuit 短路优化基准测试
 func BenchmarkMatcherEngine_Match_ShortCircuit(b *testing.B) {
 	me := NewMatcherEngine(logger.NoLogger)
