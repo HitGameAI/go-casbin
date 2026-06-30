@@ -268,6 +268,51 @@ m = g(r.sub, p.sub, r.dom) && keyMatch3(r.obj, p.obj) && (r.act == p.act || p.ac
 	assert.False(t, ok, "viewer should not POST /api/users")
 }
 
+// ==================== 纯 * 通配符资源路径测试 ====================
+
+func TestKeyMatch3WildcardResource(t *testing.T) {
+	modelText := `
+[request_definition]
+r = sub, dom, obj, act
+
+[policy_definition]
+p = sub, dom, obj, act
+
+[role_definition]
+g = _, _, _
+
+[policy_effect]
+e = some(where (p.eft == allow))
+
+[matchers]
+m = g(r.sub, p.sub, r.dom) && (p.obj == "*" || keyMatch3(r.obj, p.obj)) && (r.act == p.act || p.act == "*")
+`
+	memAdapter := policy.NewMemoryAdapter()
+	err := memAdapter.SavePolicy([]string{
+		"p, role:root, ops, *, *",
+		"g, admin001, role:root, ops",
+	})
+	require.NoError(t, err)
+
+	e, err := NewEnforcer(
+		WithModelText(modelText),
+		WithAdapter(memAdapter),
+		WithAutoSave(true),
+		WithEnabled(true),
+	)
+	require.NoError(t, err)
+	defer e.Close()
+
+	// root 角色 *,* 策略应匹配任意路径和操作
+	ok, err := e.Enforce("admin001", "ops", "/v1/game/merchants", "GET")
+	assert.NoError(t, err)
+	assert.True(t, ok, "root with *,* should access /v1/game/merchants GET")
+
+	ok, err = e.Enforce("admin001", "ops", "/v1/tenants/abc/status", "PUT")
+	assert.NoError(t, err)
+	assert.True(t, ok, "root with *,* should access any path with any method")
+}
+
 // ==================== p2 策略段（ABAC 规则）测试 ====================
 
 func TestExtraPolicySegment(t *testing.T) {

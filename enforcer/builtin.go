@@ -111,7 +111,11 @@ func KeyMatchFunc(args ...interface{}) (interface{}, error) {
 // 支持 :param 风格的路径参数匹配，将 :param 转换为正则 [^/]+
 // 例如：KeyMatch2("/foo/bar", "/foo/:bar") → true
 // 例如：KeyMatch2("/foo/bar/baz", "/foo/*") → true（/* 转为 /.*）
+// 例如：KeyMatch2("/foo/bar", "*") → true（纯 * 匹配所有路径）
 func KeyMatch2(key1, key2 string) bool {
+	if key2 == "*" {
+		return true
+	}
 	trimRequestTrailingSlash := !hasWildcardPathSuffix(key2)
 	key1 = normalizeKeyMatchPath(key1, trimRequestTrailingSlash)
 	key2 = normalizeKeyMatchPath(key2, true)
@@ -131,8 +135,12 @@ func KeyMatch2Func(args ...interface{}) (interface{}, error) {
 // KeyMatch3 路径通配符匹配（花括号版）
 // 支持 {param} 风格的路径参数匹配，将 {param} 转换为正则 [^/]+
 // 例如：KeyMatch3("/foo/bar", "/foo/{bar}") → true
+// 例如：KeyMatch3("/foo/bar", "*") → true（纯 * 匹配所有路径）
 // 与 KeyMatch2 类似，但使用花括号而非冒号表示路径参数
 func KeyMatch3(key1, key2 string) bool {
+	if key2 == "*" {
+		return true
+	}
 	trimRequestTrailingSlash := !hasWildcardPathSuffix(key2)
 	key1 = normalizeKeyMatchPath(key1, trimRequestTrailingSlash)
 	key2 = normalizeKeyMatchPath(key2, true)
