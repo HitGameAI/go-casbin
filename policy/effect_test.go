@@ -74,14 +74,14 @@ func TestEffectEvaluator_GetExpression(t *testing.T) {
 // evaluateSomeWhereP 使用 p_eft 格式表达式的测试
 func TestEffectEvaluator_SomeWhereP_Allow(t *testing.T) {
 	ee := NewEffectEvaluator("some(where (p_eft == allow))")
-	result, err := ee.evaluateSomeWhereP([]string{"allow"}, ee.effectExpr)
+	result, err := ee.Evaluate([]string{"allow"})
 	assert.NoError(t, err)
 	assert.Equal(t, EffectAllowResult, result)
 }
 
 func TestEffectEvaluator_SomeWhereP_Deny(t *testing.T) {
 	ee := NewEffectEvaluator("some(where (p_eft == allow))")
-	result, err := ee.evaluateSomeWhereP([]string{"deny"}, ee.effectExpr)
+	result, err := ee.Evaluate([]string{"deny"})
 	assert.NoError(t, err)
 	assert.Equal(t, EffectDenyResult, result)
 }
@@ -94,9 +94,9 @@ func TestEffectEvaluator_NotSomeWhere_Deny(t *testing.T) {
 }
 
 func TestEffectEvaluator_NotSomeWhere_AllowExpr(t *testing.T) {
-	// 表达式不含 "deny" 时，targetEffect 仍为 EffectDeny（默认值）
+	// 表达式不含 "deny" 时，targetEffect 仍为 EffectDeny（预计算默认值）
 	ee := NewEffectEvaluator("!some(where (p.eft == allow))")
-	result, err := ee.evaluateNotSomeWhere([]string{"allow"}, ee.effectExpr)
+	result, err := ee.Evaluate([]string{"allow"})
 	assert.NoError(t, err)
 	// targetEffect=deny，effects 中没有 deny，所以返回 Allow
 	assert.Equal(t, EffectAllowResult, result)

@@ -32,80 +32,92 @@ const (
 	EffectDenyResult  EffectResult = false // 拒绝结果
 )
 
+// 效果评估模式枚举
+// 在 NewEffectEvaluator 时预计算，避免每次 Evaluate 重复 strings.ToLower + Contains 扫描
+const (
+	evalModeNotSomeWhere = iota // !some(where (p.eft == deny))
+	evalModeSomeWhere           // some(where (p.eft == allow/deny))
+	evalModeSomeWhereP          // some(where (p_eft == allow))（与 SomeWhere 相同处理，向后兼容）
+	evalModeDefault             // 默认评估
+)
+
 // EffectEvaluator 策略效果评估器
 // 根据模型中定义的策略效果表达式（e 段），评估多条策略的组合效果
 // 支持的表达式：
 //   - some(where (p.eft == allow))：任一策略允许则允许（白名单）
 //   - !some(where (p.eft == deny))：没有策略拒绝则允许（黑名单）
 //   - some(where (p.eft == allow)) && !some(where (p.eft == deny))：有允许且无拒绝才允许
+//
+// 性能优化：evalMode/targetEffect 在构造时预计算，Evaluate 热路径仅 switch + 遍历 effects
 type EffectEvaluator struct {
-	effectExpr string // 策略效果表达式
+	effectExpr   string // 策略效果表达式（原始，用于 GetExpression）
+	evalMode     int    // 预计算的评估模式，避免每次 Evaluate 重复 strings.ToLower + Contains
+	targetEffect string // 预计算的目标效果（allow/deny），避免每次遍历前重复 Contains
 }
 
 // NewEffectEvaluator 创建策略效果评估器
 // effectExpr 为模型 e 段定义的效果表达式
+// 构造时预计算 evalMode 和 targetEffect，消除 Evaluate 热路径上的字符串扫描
 func NewEffectEvaluator(effectExpr string) *EffectEvaluator {
-	return &EffectEvaluator{effectExpr: strings.TrimSpace(effectExpr)}
+	expr := strings.TrimSpace(effectExpr)
+	lower := strings.ToLower(expr)
+
+	mode := evalModeDefault
+	target := EffectAllow
+
+	switch {
+	case strings.Contains(lower, "!some(where"):
+		mode = evalModeNotSomeWhere
+		target = EffectDeny // evaluateNotSomeWhere: targetEffect 总是 Deny
+	case strings.Contains(lower, "some(where"):
+		mode = evalModeSomeWhere
+		if strings.Contains(lower, EffectDeny) {
+			target = EffectDeny
+		}
+	case strings.Contains(lower, "some(where (p_eft"):
+		mode = evalModeSomeWhereP
+		if strings.Contains(lower, EffectDeny) {
+			target = EffectDeny
+		}
+	}
+
+	return &EffectEvaluator{
+		effectExpr:   expr,
+		evalMode:     mode,
+		targetEffect: target,
+	}
 }
 
 // Evaluate 评估策略效果
 // 根据效果表达式和各条策略的效果值，决定最终的允许/拒绝结果
 // 无匹配策略时默认拒绝
+//
+// 性能：使用预计算的 evalMode/targetEffect，避免每次调用 strings.ToLower + 多次 Contains
 func (ee *EffectEvaluator) Evaluate(effects []string) (EffectResult, error) {
 	if len(effects) == 0 {
 		return EffectDenyResult, nil
 	}
 
-	expr := strings.ToLower(ee.effectExpr)
-
-	switch {
-	case strings.Contains(expr, "!some(where"):
-		return ee.evaluateNotSomeWhere(effects, expr)
-	case strings.Contains(expr, "some(where"):
-		return ee.evaluateSomeWhere(effects, expr)
-	case strings.Contains(expr, "some(where (p_eft"):
-		return ee.evaluateSomeWhereP(effects, expr)
+	switch ee.evalMode {
+	case evalModeNotSomeWhere:
+		// !some(where (p.eft == deny))：没有匹配 deny 则允许
+		for _, eft := range effects {
+			if eft == ee.targetEffect {
+				return EffectDenyResult, nil
+			}
+		}
+		return EffectAllowResult, nil
+	case evalModeSomeWhere, evalModeSomeWhereP:
+		// some(where (p.eft == allow/deny))：匹配目标效果即允许
+		for _, eft := range effects {
+			if eft == ee.targetEffect {
+				return EffectAllowResult, nil
+			}
+		}
+		return EffectDenyResult, nil
 	default:
 		return ee.evaluateDefault(effects)
 	}
-}
-
-// evaluateSomeWhere 评估 "some(where (p.eft == allow/deny))" 表达式
-// 只要有一条策略匹配目标效果就允许
-func (ee *EffectEvaluator) evaluateSomeWhere(effects []string, expr string) (EffectResult, error) {
-	targetEffect := EffectAllow
-	if strings.Contains(expr, EffectDeny) {
-		targetEffect = EffectDeny
-	}
-
-	for _, eft := range effects {
-		if eft == targetEffect {
-			return EffectAllowResult, nil
-		}
-	}
-	return EffectDenyResult, nil
-}
-
-// evaluateNotSomeWhere 评估 "!some(where (p.eft == deny))" 表达式
-// 没有任何策略匹配目标效果时才允许（即没有拒绝则允许）
-func (ee *EffectEvaluator) evaluateNotSomeWhere(effects []string, expr string) (EffectResult, error) {
-	targetEffect := EffectDeny
-	if strings.Contains(expr, EffectDeny) {
-		targetEffect = EffectDeny
-	}
-
-	for _, eft := range effects {
-		if eft == targetEffect {
-			return EffectDenyResult, nil
-		}
-	}
-	return EffectAllowResult, nil
-}
-
-// evaluateSomeWhereP 评估 "some(where (p_eft == allow))" 表达式
-// 与 evaluateSomeWhere 逻辑相同，处理 p_eft 格式的表达式
-func (ee *EffectEvaluator) evaluateSomeWhereP(effects []string, expr string) (EffectResult, error) {
-	return ee.evaluateSomeWhere(effects, expr)
 }
 
 // evaluateDefault 默认效果评估

@@ -390,3 +390,57 @@ func BenchmarkMatcherEngine_Match_ShortCircuit(b *testing.B) {
 		me.Match(mc, benchMatcherACL)
 	}
 }
+
+// ==================== Enforce 结果缓存基准测试 ====================
+// 对比缓存命中（O(1)）与缓存 miss（完整 matcher 遍历）的吞吐差距
+// 验证 enforceCache 在高并发和重复请求场景下的优化效果
+
+// BenchmarkEnforce_CacheHit 同一请求重复 Enforce，缓存命中，O(1) 返回
+// 跳过 RLock + matcher O(N) 遍历，是热路径最优情况
+func BenchmarkEnforce_CacheHit(b *testing.B) {
+	e := buildBenchmarkEnforcer(b, 50)
+	defer e.Close()
+
+	// 预热缓存，确保第一次请求已写入 enforceCache
+	e.Enforce("user_000", "ops", "/api/resource0", "GET")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		e.Enforce("user_000", "ops", "/api/resource0", "GET")
+	}
+}
+
+// BenchmarkEnforce_CacheMiss 每次不同请求，缓存 miss，走完整 matcher 路径
+// 对比缓存命中的吞吐差距，体现缓存的优化价值
+func BenchmarkEnforce_CacheMiss(b *testing.B) {
+	e := buildBenchmarkEnforcer(b, 50)
+	defer e.Close()
+
+	// 预生成 50 个不同 user，轮流使用强制 miss
+	users := make([]string, 50)
+	for i := 0; i < 50; i++ {
+		users[i] = fmt.Sprintf("user_%03d", i)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		e.Enforce(users[i%50], "ops", "/api/resource0", "GET")
+	}
+}
+
+// BenchmarkEnforce_CacheParallel 并发场景下缓存命中性能
+// 验证 syncx.Map 在高并发读下的扩展性（50w QPS 场景的关键指标）
+func BenchmarkEnforce_CacheParallel(b *testing.B) {
+	e := buildBenchmarkEnforcer(b, 50)
+	defer e.Close()
+
+	// 预热缓存
+	e.Enforce("user_000", "ops", "/api/resource0", "GET")
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			e.Enforce("user_000", "ops", "/api/resource0", "GET")
+		}
+	})
+}

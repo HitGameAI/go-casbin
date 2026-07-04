@@ -71,7 +71,13 @@ var evalRegex = regexp.MustCompile(`eval\(([^)]+)\)`)
 //   - 如果没有策略（纯 ABAC 属性匹配），直接用请求参数评估 matcher
 func (me *MatcherEngine) Match(mc *MatchContext, matcherExpr string) (bool, []string, error) {
 	me.customFuncs = mc.CustomFuncs
-	matchedEffects := make([]string, 0, len(mc.Policies))
+
+	// 短路模式下延迟分配 matchedEffects：命中 allow 直接返回单元素切片
+	// 非短路模式预分配以收集所有匹配效果
+	var matchedEffects []string
+	if !mc.ShortCircuit {
+		matchedEffects = make([]string, 0, len(mc.Policies))
+	}
 
 	// 预计算表达式特征，避免每条策略重复 strings.Contains
 	hasEval := mc.HasEval
@@ -93,24 +99,46 @@ func (me *MatcherEngine) Match(mc *MatchContext, matcherExpr string) (bool, []st
 		return me.matchWithExtraPolicies(mc, matcherExpr, matchedEffects)
 	}
 
+	// vars map 复用：无 eval() 场景，预构建含 request 字段的复用 map
+	// 每条策略只更新 p.* 字段（r.* 不变），省去 N 次 map 分配 + request 拷贝
+	// evalExpr/expandEval 只读 vars 不写，复用安全；有 eval() 时必须每条策略独立 vars（p.sub_rule 值不同）
+	var reusableVars map[string]interface{}
+	if !hasEval {
+		reusableVars = me.buildVariableMap(mc.Request, nil, mc.Assertion)
+	}
+
 	for _, p := range mc.Policies {
-		vars := me.buildVariableMap(mc.Request, p, mc.Assertion)
+		var vars map[string]interface{}
+		if hasEval {
+			// 有 eval()：每条策略的 p.sub_rule 值不同，必须独立 vars
+			vars = me.buildVariableMap(mc.Request, p, mc.Assertion)
+		} else {
+			// 无 eval()：复用 vars，只更新 p.* 字段（覆盖旧值）
+			// 同一 ptype 的策略字段数固定（模型定义），不会残留多余字段
+			vars = reusableVars
+			if mc.Assertion != nil {
+				for i, token := range mc.Assertion.Tokens {
+					if i < len(p) {
+						vars[token] = p[i]
+					}
+				}
+			}
+		}
 
 		expr := matcherExpr
-
 		if hasEval {
 			expr = me.expandEval(expr, vars)
 		}
 
 		if me.evalExpr(expr, vars, mc.RoleMgr) {
 			eft := me.extractEffect(p, mc.Assertion)
-			matchedEffects = append(matchedEffects, eft)
 
 			// 短路优化：对于 some(where(p.eft==allow)) 模式，
 			// 匹配到第一条 allow 策略即可立即返回，无需遍历剩余策略
 			if mc.ShortCircuit && eft == "allow" {
-				return true, matchedEffects, nil
+				return true, []string{eft}, nil
 			}
+			matchedEffects = append(matchedEffects, eft)
 		}
 	}
 
@@ -185,6 +213,8 @@ func (me *MatcherEngine) matchWithExtraPolicies(mc *MatchContext, matcherExpr st
 
 // matchSingleSegment 匹配单策略段
 // 处理不包含额外策略段的 matcher 表达式，如 p.sub == alice
+//
+// 性能优化：与 Match 方法一致，无 eval() 场景复用 vars map，每条策略只更新 p.* 字段
 func (me *MatcherEngine) matchSingleSegment(mc *MatchContext, expr string, policies [][]string, assertion *model.Assertion, matchedEffects []string) (bool, []string, error) {
 	if matchedEffects == nil {
 		matchedEffects = make([]string, 0)
@@ -204,8 +234,28 @@ func (me *MatcherEngine) matchSingleSegment(mc *MatchContext, expr string, polic
 		return false, nil, nil
 	}
 
+	// vars map 复用：无 eval() 场景，预构建含 request 字段的复用 map
+	// 每条策略只更新 p.* 字段，省去 N 次 map 分配 + request 拷贝
+	var reusableVars map[string]interface{}
+	if !hasEval {
+		reusableVars = me.buildVariableMap(mc.Request, nil, assertion)
+	}
+
 	for _, p := range policies {
-		vars := me.buildVariableMap(mc.Request, p, assertion)
+		var vars map[string]interface{}
+		if hasEval {
+			vars = me.buildVariableMap(mc.Request, p, assertion)
+		} else {
+			vars = reusableVars
+			if assertion != nil {
+				for i, token := range assertion.Tokens {
+					if i < len(p) {
+						vars[token] = p[i]
+					}
+				}
+			}
+		}
+
 		expandedExpr := expr
 		if hasEval {
 			expandedExpr = me.expandEval(expandedExpr, vars)
