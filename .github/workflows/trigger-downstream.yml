@@ -25,7 +25,8 @@ jobs:
         shell: bash
         run: |
           current_tag="${GITHUB_REF_NAME}"
-          previous_tag="$(git tag --sort=-v:refname | grep -v "^${current_tag}$" | head -n 1 || true)"
+          # 用 -F 固定字符串 + -x 整行匹配，避免 tag 中的 . 被当作正则元字符（v1.0.0 会误匹配 v1a0b0）
+          previous_tag="$(git tag --sort=-v:refname | grep -F -v -x -- "${current_tag}" | head -n 1 || true)"
 
           if [ -z "${previous_tag}" ]; then
             echo "should-dispatch=true" >> "$GITHUB_OUTPUT"
@@ -38,7 +39,8 @@ jobs:
             exit 0
           fi
 
-          if echo "${changed_files}" | grep -Ev '(^docs/|\.md$)' >/dev/null; then
+          # 用 printf 替代 echo 避免转义歧义；正则补 ^$ 过滤空行，防止空行被误判为代码改动
+          if printf '%s\n' "${changed_files}" | grep -Eqv '(^docs/|\.md$|^$)'; then
             echo "should-dispatch=true" >> "$GITHUB_OUTPUT"
           else
             echo "should-dispatch=false" >> "$GITHUB_OUTPUT"
