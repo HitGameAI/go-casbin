@@ -1359,10 +1359,31 @@ func (e *Enforcer) GetPermissionsForUserInDomain(user, domain string) [][]string
 	roles := e.roleMgr.GetRoles(user, domain)
 	allSubjects := append([]string{user}, roles...)
 
+	subjectSet := make(map[string]struct{}, len(allSubjects))
+	for _, s := range allSubjects {
+		subjectSet[s] = struct{}{}
+	}
+
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	assertion := e.getPolicyAssertion()
+	if assertion == nil {
+		return nil
+	}
+
 	var result [][]string
-	for _, subject := range allSubjects {
-		policies := e.policy.GetFilteredPolicy(policy.PTypePolicy, 0, subject, domain)
-		result = append(result, policies...)
+	for _, p := range assertion.Policies {
+		if len(p) < 4 {
+			continue
+		}
+		if p[1] != domain {
+			continue
+		}
+		if _, ok := subjectSet[p[0]]; !ok {
+			continue
+		}
+		result = append(result, p)
 	}
 	return result
 }
