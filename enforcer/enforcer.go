@@ -2607,7 +2607,12 @@ func (e *Enforcer) evaluateEffect() (policy.EffectResult, error) {
 // loadRoleLinks 从 g 段策略构建角色继承链
 // 遍历所有 g 段策略，将角色关系注入角色管理器
 // 支持域隔离：g 段策略的第 3 个字段作为 domain 参数
+//
+// 分布式一致性修复：加载前先 Clear role manager 的 hierarchy 和 cache，
+// 防止已删除的 g 段策略残留旧继承关系（如删除用户角色后其他 pod reload 时仍保留旧 link）
+// 原实现只追加 AddLink 不清理，导致用户仍拥有已删除角色的权限
 func (e *Enforcer) loadRoleLinks() {
+	e.roleMgr.Clear()
 	for key, assertion := range e.model.GetAssertions() {
 		if strings.HasPrefix(key, model.SectionRoleDefinition) {
 			for _, p := range assertion.Policies {
