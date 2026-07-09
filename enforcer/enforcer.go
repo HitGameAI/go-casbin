@@ -1521,6 +1521,10 @@ func (e *Enforcer) GetAllRolesByDomain(domain string) []string {
 // 调用方需确保 fn 内部不会尝试获取 enforcer 锁
 // 适配器支持事务时，所有操作在同一个数据库事务中执行
 func (e *Enforcer) ExecuteInTransaction(ctx context.Context, fn func() error) error {
+	// 快速失败：上下文已取消时不再开启事务，避免 driver: bad connection 等级联错误
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if ta, ok := e.policy.GetAdapter().(policy.TransactionalAdapter); ok {
 		return ta.ExecuteInTransaction(ctx, func(txAdapter policy.Adapter) error {
 			e.mu.Lock()
