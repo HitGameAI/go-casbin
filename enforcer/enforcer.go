@@ -85,6 +85,8 @@ type Enforcer struct {
 
 	customFuncs map[string]BuiltinFunc // 自定义匹配函数（可在 matcher 表达式中使用）
 
+	rootAdapter policy.TransactionalAdapter // 根适配器（始终指向原始适配器，ExecuteInTransaction 用于开启事务，不受 SetAdapter 热替换影响）
+
 	autoSave           bool       // 是否自动保存策略到适配器（AddPolicy/RemovePolicy 时自动持久化）
 	autoBuildRoleLinks bool       // 是否自动构建角色继承链（添加 g 策略时自动更新角色关系）
 	autoNotifyWatcher  bool       // 是否自动通知策略变更（含 Pub/Sub 广播到其他节点）
@@ -184,6 +186,13 @@ func NewEnforcer(opts ...Option) (*Enforcer, error) {
 	}
 
 	e.policy = policy.NewPolicy(e.model, adapter, o.logger)
+
+	// 捕获根适配器引用，ExecuteInTransaction 始终用它开启事务
+	// 注意：NewEnforcer 直接设置 e.policy 而非走 SetAdapter，所以这里必须显式捕获
+	// 否则 e.rootAdapter 永远为 nil，ExecuteInTransaction 会走 fallback 路径，引发事务热替换竞态
+	if ta, ok := adapter.(policy.TransactionalAdapter); ok {
+		e.rootAdapter = ta
+	}
 
 	if err := e.policy.LoadPolicy(); err != nil {
 		return nil, errors.WrapError("failed to load policy", err)
@@ -1525,6 +1534,26 @@ func (e *Enforcer) ExecuteInTransaction(ctx context.Context, fn func() error) er
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// 始终使用 rootAdapter 开启事务，不用 e.policy.GetAdapter()
+	// 原因：事务执行期间 e.policy 的 adapter 会被临时替换为 txAdapter，
+	// 如果此时另一个 goroutine 调用 e.policy.GetAdapter() 会拿到 txAdapter，
+	// 然后 txAdapter.inTransaction=true 导致直接复用已提交/回滚的事务，
+	// 触发 "transaction has already been committed or rolled back" 错误。
+	// 读 rootAdapter 用 RLock 与 SetAdapter 的 Lock 同步，读完即释放，避免与回调内 Lock 死锁
+	e.mu.RLock()
+	rootAdapter := e.rootAdapter
+	e.mu.RUnlock()
+	if rootAdapter != nil {
+		return rootAdapter.ExecuteInTransaction(ctx, func(txAdapter policy.Adapter) error {
+			e.mu.Lock()
+			defer e.mu.Unlock()
+			prevAdapter := e.policy.GetAdapter()
+			e.policy.SetAdapter(txAdapter)
+			defer e.policy.SetAdapter(prevAdapter)
+			return fn()
+		})
+	}
+	// 回退：适配器不支持事务接口（如内存适配器/文件适配器）
 	if ta, ok := e.policy.GetAdapter().(policy.TransactionalAdapter); ok {
 		return ta.ExecuteInTransaction(ctx, func(txAdapter policy.Adapter) error {
 			e.mu.Lock()
@@ -2019,6 +2048,11 @@ func (e *Enforcer) SetAdapter(adapter policy.Adapter) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.policy.SetAdapter(adapter)
+	// 捕获根适配器引用，ExecuteInTransaction 始终用它开启事务
+	// 避免 e.policy.GetAdapter() 在事务热替换期间返回 txAdapter 导致竞态
+	if ta, ok := adapter.(policy.TransactionalAdapter); ok {
+		e.rootAdapter = ta
+	}
 }
 
 // GetBreaker 获取熔断器实例
