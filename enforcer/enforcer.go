@@ -650,228 +650,209 @@ func (e *Enforcer) GetFunction(name string) (BuiltinFunc, bool) {
 	return fn, ok
 }
 
+// withLockAndNotify 通用模板：锁内执行内存+DB 操作，锁外执行 NATS 通知
+// 减少 notifyPolicyChange（网络 IO）的持锁时间，避免阻塞 Enforce 读操作
+// fn 内不允许调用 notifyPolicyChange，由本方法在锁外统一处理
+func (e *Enforcer) withLockAndNotify(fn func() error, eventType policy.ChangeEventType, ptype string, oldp, newp []string) error {
+	e.mu.Lock()
+	if err := fn(); err != nil {
+		e.mu.Unlock()
+		return err
+	}
+	e.mu.Unlock()
+
+	e.notifyPolicyChange(eventType, ptype, oldp, newp)
+	return nil
+}
+
 // ==================== 策略管理 API ====================
 
 // AddPolicy 添加一条策略规则
 // 同时写入适配器（autoSave）和通知其他节点（autoNotifyWatcher）
+// 优化：notifyPolicyChange 移出锁外，减少锁内网络 IO 持锁时间
 func (e *Enforcer) AddPolicy(params ...string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if err := e.validatePolicyRule(model.SectionPolicyDefinition, policy.PTypePolicy, params); err != nil {
-		return err
-	}
-
-	// Policy 层已统一处理内存写入和适配器持久化（含回滚），无需 Enforcer 层重复写入
-	if err := e.policy.AddPolicy(model.SectionPolicyDefinition, policy.PTypePolicy, params); err != nil {
-		return err
-	}
-
-	e.invalidateExtraPoliciesCache()
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypePolicy, nil, params)
-
-	return nil
+	return e.withLockAndNotify(func() error {
+		if err := e.validatePolicyRule(model.SectionPolicyDefinition, policy.PTypePolicy, params); err != nil {
+			return err
+		}
+		if err := e.policy.AddPolicy(model.SectionPolicyDefinition, policy.PTypePolicy, params); err != nil {
+			return err
+		}
+		e.invalidateExtraPoliciesCache()
+		return nil
+	}, policy.EventTypePolicyAdded, policy.PTypePolicy, nil, params)
 }
 
 // AddPolicies 批量添加策略规则
 func (e *Enforcer) AddPolicies(rules [][]string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	for _, rule := range rules {
-		if err := e.validatePolicyRule(model.SectionPolicyDefinition, policy.PTypePolicy, rule); err != nil {
+	return e.withLockAndNotify(func() error {
+		for _, rule := range rules {
+			if err := e.validatePolicyRule(model.SectionPolicyDefinition, policy.PTypePolicy, rule); err != nil {
+				return err
+			}
+		}
+		if err := e.policy.AddPolicies(model.SectionPolicyDefinition, policy.PTypePolicy, rules); err != nil {
 			return err
 		}
-	}
-
-	// Policy 层已统一处理内存写入和适配器持久化（含回滚），无需 Enforcer 层重复写入
-	if err := e.policy.AddPolicies(model.SectionPolicyDefinition, policy.PTypePolicy, rules); err != nil {
-		return err
-	}
-
-	e.invalidateExtraPoliciesCache()
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypePolicy, nil, nil)
-
-	return nil
+		e.invalidateExtraPoliciesCache()
+		return nil
+	}, policy.EventTypePolicyAdded, policy.PTypePolicy, nil, nil)
 }
 
 // AddPoliciesEx 批量添加策略规则（忽略已存在的规则）
 func (e *Enforcer) AddPoliciesEx(rules [][]string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if err := e.policy.AddPoliciesEx(model.SectionPolicyDefinition, policy.PTypePolicy, rules); err != nil {
-		return err
-	}
-	e.invalidateExtraPoliciesCache()
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypePolicy, nil, nil)
-	return nil
+	return e.withLockAndNotify(func() error {
+		if err := e.policy.AddPoliciesEx(model.SectionPolicyDefinition, policy.PTypePolicy, rules); err != nil {
+			return err
+		}
+		e.invalidateExtraPoliciesCache()
+		return nil
+	}, policy.EventTypePolicyAdded, policy.PTypePolicy, nil, nil)
 }
 
 // AddNamedPolicy 添加指定类型的策略规则
 func (e *Enforcer) AddNamedPolicy(ptype string, params ...string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	// Policy 层已统一处理内存写入和适配器持久化（含回滚），无需 Enforcer 层重复写入
-	if err := e.policy.AddPolicy(model.SectionPolicyDefinition, ptype, params); err != nil {
-		return err
-	}
-
-	e.invalidateExtraPoliciesCache()
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, ptype, nil, params)
-	return nil
+	return e.withLockAndNotify(func() error {
+		if err := e.policy.AddPolicy(model.SectionPolicyDefinition, ptype, params); err != nil {
+			return err
+		}
+		e.invalidateExtraPoliciesCache()
+		return nil
+	}, policy.EventTypePolicyAdded, ptype, nil, params)
 }
 
 // AddNamedPolicies 批量添加指定类型的策略规则
 func (e *Enforcer) AddNamedPolicies(ptype string, rules [][]string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if err := e.policy.AddPolicies(model.SectionPolicyDefinition, ptype, rules); err != nil {
-		return err
-	}
-	e.invalidateExtraPoliciesCache()
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, ptype, nil, nil)
-	return nil
+	return e.withLockAndNotify(func() error {
+		if err := e.policy.AddPolicies(model.SectionPolicyDefinition, ptype, rules); err != nil {
+			return err
+		}
+		e.invalidateExtraPoliciesCache()
+		return nil
+	}, policy.EventTypePolicyAdded, ptype, nil, nil)
 }
 
 // AddNamedPoliciesEx 批量添加指定类型的策略规则（忽略已存在的规则）
 func (e *Enforcer) AddNamedPoliciesEx(ptype string, rules [][]string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if err := e.policy.AddPoliciesEx(model.SectionPolicyDefinition, ptype, rules); err != nil {
-		return err
-	}
-	e.invalidateExtraPoliciesCache()
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, ptype, nil, nil)
-	return nil
+	return e.withLockAndNotify(func() error {
+		if err := e.policy.AddPoliciesEx(model.SectionPolicyDefinition, ptype, rules); err != nil {
+			return err
+		}
+		e.invalidateExtraPoliciesCache()
+		return nil
+	}, policy.EventTypePolicyAdded, ptype, nil, nil)
 }
 
 // RemovePolicy 删除一条策略规则
 func (e *Enforcer) RemovePolicy(params ...string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	return e.withLockAndNotify(func() error {
+		// Policy 层已统一处理内存删除和适配器持久化（含回滚），无需 Enforcer 层重复写入
+		if err := e.policy.RemovePolicy(model.SectionPolicyDefinition, policy.PTypePolicy, params); err != nil {
+			return err
+		}
 
-	// Policy 层已统一处理内存删除和适配器持久化（含回滚），无需 Enforcer 层重复写入
-	if err := e.policy.RemovePolicy(model.SectionPolicyDefinition, policy.PTypePolicy, params); err != nil {
-		return err
-	}
-
-	e.invalidateExtraPoliciesCache()
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypePolicy, params, nil)
-
-	return nil
+		e.invalidateExtraPoliciesCache()
+		return nil
+	}, policy.EventTypePolicyRemoved, policy.PTypePolicy, params, nil)
 }
 
 // RemovePolicies 批量删除策略规则
 func (e *Enforcer) RemovePolicies(rules [][]string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	return e.withLockAndNotify(func() error {
+		// Policy 层已统一处理内存删除和适配器持久化（含回滚），无需 Enforcer 层重复写入
+		if err := e.policy.RemovePolicies(model.SectionPolicyDefinition, policy.PTypePolicy, rules); err != nil {
+			return err
+		}
 
-	// Policy 层已统一处理内存删除和适配器持久化（含回滚），无需 Enforcer 层重复写入
-	if err := e.policy.RemovePolicies(model.SectionPolicyDefinition, policy.PTypePolicy, rules); err != nil {
-		return err
-	}
-
-	e.invalidateExtraPoliciesCache()
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypePolicy, nil, nil)
-
-	return nil
+		e.invalidateExtraPoliciesCache()
+		return nil
+	}, policy.EventTypePolicyRemoved, policy.PTypePolicy, nil, nil)
 }
 
 // RemoveFilteredPolicy 按字段过滤删除策略规则
 // fieldIndex: 起始字段索引，fieldValues: 过滤字段值
 func (e *Enforcer) RemoveFilteredPolicy(fieldIndex int, fieldValues ...string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.invalidateExtraPoliciesCache()
-	if err := e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, policy.PTypePolicy, fieldIndex, fieldValues...); err != nil {
-		return err
-	}
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypePolicy, nil, nil)
-	return nil
+	return e.withLockAndNotify(func() error {
+		e.invalidateExtraPoliciesCache()
+		if err := e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, policy.PTypePolicy, fieldIndex, fieldValues...); err != nil {
+			return err
+		}
+		return nil
+	}, policy.EventTypePolicyRemoved, policy.PTypePolicy, nil, nil)
 }
 
 // RemoveNamedPolicy 删除指定类型的策略规则
 func (e *Enforcer) RemoveNamedPolicy(ptype string, params ...string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	return e.withLockAndNotify(func() error {
+		// Policy 层已统一处理内存删除和适配器持久化（含回滚），无需 Enforcer 层重复写入
+		if err := e.policy.RemovePolicy(model.SectionPolicyDefinition, ptype, params); err != nil {
+			return err
+		}
 
-	// Policy 层已统一处理内存删除和适配器持久化（含回滚），无需 Enforcer 层重复写入
-	if err := e.policy.RemovePolicy(model.SectionPolicyDefinition, ptype, params); err != nil {
-		return err
-	}
-
-	e.invalidateExtraPoliciesCache()
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, ptype, params, nil)
-	return nil
+		e.invalidateExtraPoliciesCache()
+		return nil
+	}, policy.EventTypePolicyRemoved, ptype, params, nil)
 }
 
 // RemoveNamedPolicies 批量删除指定类型的策略规则
 func (e *Enforcer) RemoveNamedPolicies(ptype string, rules [][]string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if err := e.policy.RemovePolicies(model.SectionPolicyDefinition, ptype, rules); err != nil {
-		return err
-	}
-	e.invalidateExtraPoliciesCache()
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, ptype, nil, nil)
-	return nil
+	return e.withLockAndNotify(func() error {
+		if err := e.policy.RemovePolicies(model.SectionPolicyDefinition, ptype, rules); err != nil {
+			return err
+		}
+		e.invalidateExtraPoliciesCache()
+		return nil
+	}, policy.EventTypePolicyRemoved, ptype, nil, nil)
 }
 
 // RemoveFilteredNamedPolicy 按字段过滤删除指定类型的策略规则
 func (e *Enforcer) RemoveFilteredNamedPolicy(ptype string, fieldIndex int, fieldValues ...string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if err := e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, ptype, fieldIndex, fieldValues...); err != nil {
-		return err
-	}
-	e.invalidateExtraPoliciesCache()
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, ptype, nil, nil)
-	return nil
+	return e.withLockAndNotify(func() error {
+		if err := e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, ptype, fieldIndex, fieldValues...); err != nil {
+			return err
+		}
+		e.invalidateExtraPoliciesCache()
+		return nil
+	}, policy.EventTypePolicyRemoved, ptype, nil, nil)
 }
 
 // UpdatePolicy 更新一条策略规则
 func (e *Enforcer) UpdatePolicy(oldPolicy, newPolicy []string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.invalidateExtraPoliciesCache()
-	if err := e.policy.UpdatePolicy(model.SectionPolicyDefinition, policy.PTypePolicy, oldPolicy, newPolicy); err != nil {
-		return err
-	}
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypePolicy, nil, nil)
-	return nil
+	return e.withLockAndNotify(func() error {
+		e.invalidateExtraPoliciesCache()
+		if err := e.policy.UpdatePolicy(model.SectionPolicyDefinition, policy.PTypePolicy, oldPolicy, newPolicy); err != nil {
+			return err
+		}
+		return nil
+	}, policy.EventTypePolicyAdded, policy.PTypePolicy, nil, nil)
 }
 
 // UpdatePolicies 批量更新策略规则
 func (e *Enforcer) UpdatePolicies(oldPolicies, newPolicies [][]string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.invalidateExtraPoliciesCache()
-	if err := e.policy.UpdatePolicies(model.SectionPolicyDefinition, policy.PTypePolicy, oldPolicies, newPolicies); err != nil {
-		return err
-	}
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypePolicy, nil, nil)
-	return nil
+	return e.withLockAndNotify(func() error {
+		e.invalidateExtraPoliciesCache()
+		if err := e.policy.UpdatePolicies(model.SectionPolicyDefinition, policy.PTypePolicy, oldPolicies, newPolicies); err != nil {
+			return err
+		}
+		return nil
+	}, policy.EventTypePolicyAdded, policy.PTypePolicy, nil, nil)
 }
 
 // UpdateFilteredPolicies 按过滤条件更新策略规则
 func (e *Enforcer) UpdateFilteredPolicies(newPolicies [][]string, fieldIndex int, fieldValues ...string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	return e.withLockAndNotify(func() error {
+		for _, rule := range newPolicies {
+			if err := e.validatePolicyRule(model.SectionPolicyDefinition, policy.PTypePolicy, rule); err != nil {
+				return err
+			}
+		}
 
-	for _, rule := range newPolicies {
-		if err := e.validatePolicyRule(model.SectionPolicyDefinition, policy.PTypePolicy, rule); err != nil {
+		e.invalidateExtraPoliciesCache()
+		if err := e.policy.UpdateFilteredPolicies(model.SectionPolicyDefinition, policy.PTypePolicy, newPolicies, fieldIndex, fieldValues...); err != nil {
 			return err
 		}
-	}
-
-	e.invalidateExtraPoliciesCache()
-	if err := e.policy.UpdateFilteredPolicies(model.SectionPolicyDefinition, policy.PTypePolicy, newPolicies, fieldIndex, fieldValues...); err != nil {
-		return err
-	}
-
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypePolicy, nil, nil)
-	return nil
+		return nil
+	}, policy.EventTypePolicyAdded, policy.PTypePolicy, nil, nil)
 }
 
 // ==================== 角色分组策略 API ====================
@@ -879,171 +860,150 @@ func (e *Enforcer) UpdateFilteredPolicies(newPolicies [][]string, fieldIndex int
 // AddGroupingPolicy 添加角色分组策略（g 策略）
 // 同时更新角色继承链、写入适配器和通知其他节点
 func (e *Enforcer) AddGroupingPolicy(params ...string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if err := e.policy.AddPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, params); err != nil {
-		return err
-	}
-
-	if len(params) >= 2 && e.autoBuildRoleLinks {
-		domain := make([]string, 0)
-		if len(params) >= 3 {
-			domain = append(domain, params[2])
-		}
-		if err := e.roleMgr.AddLink(params[0], params[1], domain...); err != nil {
+	return e.withLockAndNotify(func() error {
+		if err := e.policy.AddPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, params); err != nil {
 			return err
 		}
-	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, params)
-
-	return nil
+		if len(params) >= 2 && e.autoBuildRoleLinks {
+			domain := make([]string, 0)
+			if len(params) >= 3 {
+				domain = append(domain, params[2])
+			}
+			if err := e.roleMgr.AddLink(params[0], params[1], domain...); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, params)
 }
 
 // AddGroupingPolicies 批量添加角色分组策略
 func (e *Enforcer) AddGroupingPolicies(rules [][]string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	return e.withLockAndNotify(func() error {
+		if err := e.policy.AddPolicies(model.SectionRoleDefinition, policy.PTypeGrouping, rules); err != nil {
+			return err
+		}
 
-	if err := e.policy.AddPolicies(model.SectionRoleDefinition, policy.PTypeGrouping, rules); err != nil {
-		return err
-	}
-
-	if e.autoBuildRoleLinks {
-		for _, rule := range rules {
-			if len(rule) >= 2 {
-				domain := make([]string, 0)
-				if len(rule) >= 3 {
-					domain = append(domain, rule[2])
+		if e.autoBuildRoleLinks {
+			for _, rule := range rules {
+				if len(rule) >= 2 {
+					domain := make([]string, 0)
+					if len(rule) >= 3 {
+						domain = append(domain, rule[2])
+					}
+					_ = e.roleMgr.AddLink(rule[0], rule[1], domain...)
 				}
-				_ = e.roleMgr.AddLink(rule[0], rule[1], domain...)
 			}
 		}
-	}
-
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, nil)
-
-	return nil
+		return nil
+	}, policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, nil)
 }
 
 // AddGroupingPoliciesEx 批量添加角色分组策略（忽略已存在的规则）
 func (e *Enforcer) AddGroupingPoliciesEx(rules [][]string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if err := e.policy.AddPoliciesEx(model.SectionRoleDefinition, policy.PTypeGrouping, rules); err != nil {
-		return err
-	}
-	if e.autoBuildRoleLinks {
-		for _, rule := range rules {
-			if len(rule) >= 2 {
-				domain := make([]string, 0)
-				if len(rule) >= 3 {
-					domain = append(domain, rule[2])
+	return e.withLockAndNotify(func() error {
+		if err := e.policy.AddPoliciesEx(model.SectionRoleDefinition, policy.PTypeGrouping, rules); err != nil {
+			return err
+		}
+		if e.autoBuildRoleLinks {
+			for _, rule := range rules {
+				if len(rule) >= 2 {
+					domain := make([]string, 0)
+					if len(rule) >= 3 {
+						domain = append(domain, rule[2])
+					}
+					_ = e.roleMgr.AddLink(rule[0], rule[1], domain...)
 				}
-				_ = e.roleMgr.AddLink(rule[0], rule[1], domain...)
 			}
 		}
-	}
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, nil)
-	return nil
+		return nil
+	}, policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, nil)
 }
 
 // RemoveGroupingPolicy 删除角色分组策略
 // 同时更新角色继承链、从适配器删除和通知其他节点
 func (e *Enforcer) RemoveGroupingPolicy(params ...string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if err := e.policy.RemovePolicy(model.SectionRoleDefinition, policy.PTypeGrouping, params); err != nil {
-		return err
-	}
-
-	if len(params) >= 2 && e.autoBuildRoleLinks {
-		domain := make([]string, 0)
-		if len(params) >= 3 {
-			domain = append(domain, params[2])
+	return e.withLockAndNotify(func() error {
+		if err := e.policy.RemovePolicy(model.SectionRoleDefinition, policy.PTypeGrouping, params); err != nil {
+			return err
 		}
-		e.roleMgr.DeleteLink(params[0], params[1], domain...)
-	}
 
-	if e.autoSave && e.policy.GetAdapter() != nil {
-		line := "g, " + strings.Join(params, ", ")
-		if err := e.policy.GetAdapter().RemovePolicy(line); err != nil {
-			return errors.WrapError("auto-remove grouping policy", err)
+		if len(params) >= 2 && e.autoBuildRoleLinks {
+			domain := make([]string, 0)
+			if len(params) >= 3 {
+				domain = append(domain, params[2])
+			}
+			e.roleMgr.DeleteLink(params[0], params[1], domain...)
 		}
-	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, params, nil)
-
-	return nil
+		if e.autoSave && e.policy.GetAdapter() != nil {
+			line := "g, " + strings.Join(params, ", ")
+			if err := e.policy.GetAdapter().RemovePolicy(line); err != nil {
+				return errors.WrapError("auto-remove grouping policy", err)
+			}
+		}
+		return nil
+	}, policy.EventTypePolicyRemoved, policy.PTypeGrouping, params, nil)
 }
 
 // RemoveGroupingPolicies 批量删除角色分组策略
 func (e *Enforcer) RemoveGroupingPolicies(rules [][]string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if err := e.policy.RemovePolicies(model.SectionRoleDefinition, policy.PTypeGrouping, rules); err != nil {
-		return err
-	}
-
-	if e.autoBuildRoleLinks {
-		for _, rule := range rules {
-			if len(rule) >= 2 {
-				domain := make([]string, 0)
-				if len(rule) >= 3 {
-					domain = append(domain, rule[2])
-				}
-				e.roleMgr.DeleteLink(rule[0], rule[1], domain...)
-			}
+	return e.withLockAndNotify(func() error {
+		if err := e.policy.RemovePolicies(model.SectionRoleDefinition, policy.PTypeGrouping, rules); err != nil {
+			return err
 		}
-	}
 
-	if e.autoSave && e.policy.GetAdapter() != nil {
-		if ba, ok := e.policy.GetAdapter().(policy.BatchAdapter); ok {
-			var lines []string
+		if e.autoBuildRoleLinks {
 			for _, rule := range rules {
-				lines = append(lines, "g, "+strings.Join(rule, ", "))
-			}
-			if err := ba.RemovePolicies(lines); err != nil {
-				return errors.WrapError("auto-remove grouping policies", err)
+				if len(rule) >= 2 {
+					domain := make([]string, 0)
+					if len(rule) >= 3 {
+						domain = append(domain, rule[2])
+					}
+					e.roleMgr.DeleteLink(rule[0], rule[1], domain...)
+				}
 			}
 		}
-	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
-
-	return nil
+		if e.autoSave && e.policy.GetAdapter() != nil {
+			if ba, ok := e.policy.GetAdapter().(policy.BatchAdapter); ok {
+				var lines []string
+				for _, rule := range rules {
+					lines = append(lines, "g, "+strings.Join(rule, ", "))
+				}
+				if err := ba.RemovePolicies(lines); err != nil {
+					return errors.WrapError("auto-remove grouping policies", err)
+				}
+			}
+		}
+		return nil
+	}, policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
 }
 
 // RemoveFilteredGroupingPolicy 按字段过滤删除角色分组策略
 // 同时清理角色管理器、适配器持久化和分布式通知
 func (e *Enforcer) RemoveFilteredGroupingPolicy(fieldIndex int, fieldValues ...string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	return e.withLockAndNotify(func() error {
+		removed := e.policy.GetFilteredPolicy(policy.PTypeGrouping, fieldIndex, fieldValues...)
 
-	removed := e.policy.GetFilteredPolicy(policy.PTypeGrouping, fieldIndex, fieldValues...)
+		if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, fieldIndex, fieldValues...); err != nil {
+			return err
+		}
 
-	if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, fieldIndex, fieldValues...); err != nil {
-		return err
-	}
-
-	if e.autoBuildRoleLinks {
-		for _, rule := range removed {
-			if len(rule) >= 2 {
-				domain := make([]string, 0)
-				if len(rule) >= 3 {
-					domain = append(domain, rule[2])
+		if e.autoBuildRoleLinks {
+			for _, rule := range removed {
+				if len(rule) >= 2 {
+					domain := make([]string, 0)
+					if len(rule) >= 3 {
+						domain = append(domain, rule[2])
+					}
+					e.roleMgr.DeleteLink(rule[0], rule[1], domain...)
 				}
-				e.roleMgr.DeleteLink(rule[0], rule[1], domain...)
 			}
 		}
-	}
-
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
-
-	return nil
+		return nil
+	}, policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
 }
 
 // DeleteRoleAssignments 删除指定角色的所有分配关系
@@ -1057,87 +1017,76 @@ func (e *Enforcer) DeleteRoleAssignments(roleName string) error {
 // 用于租户删除等场景，彻底清空 enforcer 中的 p 段和 g 段数据
 // 同时清理角色管理器、适配器持久化和分布式通知
 func (e *Enforcer) ClearAllPolicies() error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	return e.withLockAndNotify(func() error {
+		e.model.ClearPolicies()
+		e.roleMgr.Clear()
+		e.invalidateExtraPoliciesCache()
 
-	e.model.ClearPolicies()
-	e.roleMgr.Clear()
-	e.invalidateExtraPoliciesCache()
-
-	if e.autoSave && e.policy.GetAdapter() != nil {
-		if err := e.policy.GetAdapter().SavePolicy(nil); err != nil {
-			return errors.WrapError("clear all policies", err)
+		if e.autoSave && e.policy.GetAdapter() != nil {
+			if err := e.policy.GetAdapter().SavePolicy(nil); err != nil {
+				return errors.WrapError("clear all policies", err)
+			}
 		}
-	}
-
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypePolicy, nil, nil)
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
-
-	return nil
+		return nil
+	}, policy.EventTypePolicyRemoved, "", nil, nil)
 }
 
 // UpdateGroupingPolicy 更新角色分组策略
 func (e *Enforcer) UpdateGroupingPolicy(oldRule, newRule []string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if err := e.policy.UpdatePolicy(model.SectionRoleDefinition, policy.PTypeGrouping, oldRule, newRule); err != nil {
-		return err
-	}
-
-	if e.autoBuildRoleLinks {
-		if len(oldRule) >= 2 {
-			domain := make([]string, 0)
-			if len(oldRule) >= 3 {
-				domain = append(domain, oldRule[2])
-			}
-			e.roleMgr.DeleteLink(oldRule[0], oldRule[1], domain...)
+	return e.withLockAndNotify(func() error {
+		if err := e.policy.UpdatePolicy(model.SectionRoleDefinition, policy.PTypeGrouping, oldRule, newRule); err != nil {
+			return err
 		}
-		if len(newRule) >= 2 {
-			domain := make([]string, 0)
-			if len(newRule) >= 3 {
-				domain = append(domain, newRule[2])
-			}
-			_ = e.roleMgr.AddLink(newRule[0], newRule[1], domain...)
-		}
-	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, nil)
-	return nil
+		if e.autoBuildRoleLinks {
+			if len(oldRule) >= 2 {
+				domain := make([]string, 0)
+				if len(oldRule) >= 3 {
+					domain = append(domain, oldRule[2])
+				}
+				e.roleMgr.DeleteLink(oldRule[0], oldRule[1], domain...)
+			}
+			if len(newRule) >= 2 {
+				domain := make([]string, 0)
+				if len(newRule) >= 3 {
+					domain = append(domain, newRule[2])
+				}
+				_ = e.roleMgr.AddLink(newRule[0], newRule[1], domain...)
+			}
+		}
+		return nil
+	}, policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, nil)
 }
 
 // UpdateGroupingPolicies 批量更新角色分组策略
 func (e *Enforcer) UpdateGroupingPolicies(oldRules, newRules [][]string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	return e.withLockAndNotify(func() error {
+		if err := e.policy.UpdatePolicies(model.SectionRoleDefinition, policy.PTypeGrouping, oldRules, newRules); err != nil {
+			return err
+		}
 
-	if err := e.policy.UpdatePolicies(model.SectionRoleDefinition, policy.PTypeGrouping, oldRules, newRules); err != nil {
-		return err
-	}
-
-	if e.autoBuildRoleLinks {
-		for _, old := range oldRules {
-			if len(old) >= 2 {
-				domain := make([]string, 0)
-				if len(old) >= 3 {
-					domain = append(domain, old[2])
+		if e.autoBuildRoleLinks {
+			for _, old := range oldRules {
+				if len(old) >= 2 {
+					domain := make([]string, 0)
+					if len(old) >= 3 {
+						domain = append(domain, old[2])
+					}
+					e.roleMgr.DeleteLink(old[0], old[1], domain...)
 				}
-				e.roleMgr.DeleteLink(old[0], old[1], domain...)
+			}
+			for _, newR := range newRules {
+				if len(newR) >= 2 {
+					domain := make([]string, 0)
+					if len(newR) >= 3 {
+						domain = append(domain, newR[2])
+					}
+					_ = e.roleMgr.AddLink(newR[0], newR[1], domain...)
+				}
 			}
 		}
-		for _, newR := range newRules {
-			if len(newR) >= 2 {
-				domain := make([]string, 0)
-				if len(newR) >= 3 {
-					domain = append(domain, newR[2])
-				}
-				_ = e.roleMgr.AddLink(newR[0], newR[1], domain...)
-			}
-		}
-	}
-
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, nil)
-	return nil
+		return nil
+	}, policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, nil)
 }
 
 // ==================== RBAC API ====================
