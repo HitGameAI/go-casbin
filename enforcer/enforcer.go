@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kamalyes/go-casbin/errors"
@@ -40,6 +41,10 @@ const (
 // enforceCacheTTL Enforce 结果缓存存活时长
 // 策略变更时主动失效；分布式场景下各实例独立缓存，通过短 TTL 容忍秒级不一致
 const enforceCacheTTL = 30 * time.Second
+
+// enforceCacheCleanupEvery 每隔多少次 Store 触发一次异步清理过期条目
+// 避免高基数场景下 enforceCache 无限增长导致 OOM
+const enforceCacheCleanupEvery = 1000
 
 // 策略主体常量
 const (
@@ -106,13 +111,18 @@ type Enforcer struct {
 
 	// Enforce 结果缓存：缓存 (sub,obj,act,...) → allow/deny，命中后跳过 RLock+matcher，O(1) 返回
 	// 仅缓存全 string 的 rvals（ABAC 结构体不缓存）；策略变更时主动失效
-	enforceCache syncx.Map[string, enforceCacheEntry]
+	// 使用版本号机制实现 O(1) 失效：策略变更时递增版本号，旧条目在 Load 时自然忽略
+	// 定期异步清理过期条目，防止高基数场景下内存无限增长
+	enforceCache        syncx.Map[string, enforceCacheEntry]
+	enforceCacheVersion atomic.Uint64 // 策略变更时递增，使所有旧版本号条目失效
+	enforceCacheStores  atomic.Uint64 // Store 调用计数，用于触发定期清理
 }
 
 // enforceCacheEntry Enforce 结果缓存条目
 type enforceCacheEntry struct {
 	result    bool
 	expiresAt time.Time
+	version   uint64 // 创建时的 enforceCacheVersion，版本号不匹配时视为失效
 }
 
 // NewEnforcer 创建核心执行器
@@ -280,7 +290,7 @@ func (e *Enforcer) Enforce(rvals ...interface{}) (bool, error) {
 // 性能优化：Enforce 结果缓存
 //   - 仅缓存全 string 的 rvals（ABAC 结构体不缓存）
 //   - 命中后跳过 RLock+matcher，O(1) 返回，热路径吞吐提升 5-10 倍
-//   - 策略变更时主动失效（invalidateExtraPoliciesCache 联动）
+//   - 策略变更时通过版本号 O(1) 失效（invalidateExtraPoliciesCache 联动）
 //   - 分布式场景下各实例独立缓存，通过短 TTL 容忍秒级不一致
 func (e *Enforcer) EnforceContext(ctx context.Context, rvals ...interface{}) (bool, error) {
 	if !e.enabled {
@@ -293,17 +303,24 @@ func (e *Enforcer) EnforceContext(ctx context.Context, rvals ...interface{}) (bo
 
 	// Enforce 结果缓存：命中后 O(1) 返回，跳过 RLock+matcher
 	// 仅缓存全 string 的 rvals（ABAC 结构体不缓存）
+	// 版本号不匹配时视为失效（策略已变更），不返回旧结果
 	if cacheKey, cacheable := buildEnforceCacheKey(rvals); cacheable {
-		if entry, hit := e.enforceCache.Load(cacheKey); hit && time.Now().Before(entry.expiresAt) {
+		currentVersion := e.enforceCacheVersion.Load()
+		if entry, hit := e.enforceCache.Load(cacheKey); hit && entry.version == currentVersion && time.Now().Before(entry.expiresAt) {
 			return entry.result, nil
 		}
-		// 缓存 miss 或过期，走 enforceCore 后回填
+		// 缓存 miss 或过期或版本号不匹配，走 enforceCore 后回填
 		result, err := e.enforceCore(ctx, rvals...)
 		if err == nil {
 			e.enforceCache.Store(cacheKey, enforceCacheEntry{
 				result:    result,
 				expiresAt: time.Now().Add(enforceCacheTTL),
+				version:   currentVersion,
 			})
+			// 定期触发异步清理过期条目，防止高基数场景下内存无限增长
+			if e.enforceCacheStores.Add(1)%enforceCacheCleanupEvery == 0 {
+				go e.cleanupEnforceCache(currentVersion)
+			}
 		}
 		return result, err
 	}
@@ -400,11 +417,21 @@ func buildEnforceCacheKey(rvals []interface{}) (string, bool) {
 	return result, true
 }
 
-// invalidateEnforceCache 清空 Enforce 结果缓存
-// 在策略增删改时调用（由 invalidateExtraPoliciesCache 联动触发）
+// invalidateEnforceCache 使所有 Enforce 结果缓存失效
+// 使用版本号机制实现 O(1) 失效：递增版本号后，旧条目在 Load 时因版本号不匹配被自然忽略
+// 过期条目由 cleanupEnforceCache 定期异步清理，不影响热路径性能
 func (e *Enforcer) invalidateEnforceCache() {
-	e.enforceCache.Range(func(key string, _ enforceCacheEntry) bool {
-		e.enforceCache.Delete(key)
+	e.enforceCacheVersion.Add(1)
+}
+
+// cleanupEnforceCache 清理过期或版本号不匹配的缓存条目
+// 在后台 goroutine 中执行，不阻塞 Enforce 热路径
+func (e *Enforcer) cleanupEnforceCache(currentVersion uint64) {
+	now := time.Now()
+	e.enforceCache.Range(func(key string, entry enforceCacheEntry) bool {
+		if entry.version != currentVersion || now.After(entry.expiresAt) {
+			e.enforceCache.Delete(key)
+		}
 		return true
 	})
 }
@@ -1574,53 +1601,59 @@ func (e *Enforcer) ExecuteInTransaction(ctx context.Context, fn func() error) er
 // 先删除用户所有旧角色（含 g 段策略和适配器），再批量添加新角色
 // 适用于用户角色绑定变更场景，确保角色替换的原子性
 // groupingRules 每个元素格式为 [user, roleName, domain]
+//
+// 优化：
+//   - 使用 UpdateFilteredPolicies 合并 DELETE+INSERT 为单次 DB 操作
+//   - notifyPolicyChange 移到事务提交后执行，减少锁内网络 IO 持锁时间
 func (e *Enforcer) TransactionalSyncUserRoles(ctx context.Context, user string, groupingRules [][]string) error {
-	return e.ExecuteInTransaction(ctx, func() error {
+	err := e.ExecuteInTransaction(ctx, func() error {
+		// 先清理旧 roleMgr 链接（基于内存中现有策略）
 		existingGrouping := e.policy.GetFilteredPolicy(policy.PTypeGrouping, 0, user)
-		if len(existingGrouping) > 0 {
-			for _, rule := range existingGrouping {
+		for _, rule := range existingGrouping {
+			if len(rule) >= 2 {
+				domain := make([]string, 0)
+				if len(rule) >= 3 {
+					domain = append(domain, rule[2])
+				}
+				e.roleMgr.DeleteLink(rule[0], rule[1], domain...)
+			}
+		}
+
+		// 用 UpdateFilteredPolicies 合并删除旧策略+插入新策略为单次 DB 操作
+		// 替代之前的 RemoveFilteredPolicy + AddPolicies（两次 DB 操作）
+		if err := e.policy.UpdateFilteredPolicies(model.SectionRoleDefinition, policy.PTypeGrouping, groupingRules, 0, user); err != nil {
+			return err
+		}
+
+		// 添加新 roleMgr 链接
+		if e.autoBuildRoleLinks {
+			for _, rule := range groupingRules {
 				if len(rule) >= 2 {
 					domain := make([]string, 0)
 					if len(rule) >= 3 {
 						domain = append(domain, rule[2])
 					}
-					e.roleMgr.DeleteLink(rule[0], rule[1], domain...)
+					_ = e.roleMgr.AddLink(rule[0], rule[1], domain...)
 				}
 			}
-			if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, 0, user); err != nil {
-				return err
-			}
 		}
-
-		if len(groupingRules) > 0 {
-			if err := e.policy.AddPolicies(model.SectionRoleDefinition, policy.PTypeGrouping, groupingRules); err != nil {
-				return err
-			}
-
-			if e.autoBuildRoleLinks {
-				for _, rule := range groupingRules {
-					if len(rule) >= 2 {
-						domain := make([]string, 0)
-						if len(rule) >= 3 {
-							domain = append(domain, rule[2])
-						}
-						_ = e.roleMgr.AddLink(rule[0], rule[1], domain...)
-					}
-				}
-			}
-
-		}
-
-		e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, nil)
 
 		return nil
 	})
+	// 事务提交成功后再通知，避免回滚时发出错误通知
+	if err == nil {
+		e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, nil)
+	}
+	return err
 }
 
 // TransactionalDeleteUser 在事务中删除用户及其所有角色关系和权限
 // 同时清理 p 段策略、g 段策略、角色管理器和适配器
+//
+// 优化：notifyPolicyChange 移到事务提交后执行，减少锁内网络 IO 持锁时间
+// p+g 段同时变更，合并为一次通知（PType="" 表示多类型变更），减少 NATS 往返
 func (e *Enforcer) TransactionalDeleteUser(ctx context.Context, user string) error {
-	return e.ExecuteInTransaction(ctx, func() error {
+	err := e.ExecuteInTransaction(ctx, func() error {
 		_ = e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, policy.PTypePolicy, 0, user)
 
 		existingGrouping := e.policy.GetFilteredPolicy(policy.PTypeGrouping, 0, user)
@@ -1635,17 +1668,22 @@ func (e *Enforcer) TransactionalDeleteUser(ctx context.Context, user string) err
 		}
 		_ = e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, 0, user)
 
-		e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypePolicy, nil, nil)
-		e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
-
 		return nil
 	})
+	// 事务提交成功后再通知：p+g 段合并为一次通知，减少 NATS 往返
+	if err == nil {
+		e.notifyPolicyChange(policy.EventTypePolicyRemoved, "", nil, nil)
+	}
+	return err
 }
 
 // TransactionalDeleteRole 在事务中删除角色及其所有关系
 // 同时清理 g 段策略、p 段策略、角色管理器和适配器
+//
+// 优化：notifyPolicyChange 移到事务提交后执行，减少锁内网络 IO 持锁时间
+// p+g 段同时变更，合并为一次通知（PType="" 表示多类型变更），减少 NATS 往返
 func (e *Enforcer) TransactionalDeleteRole(ctx context.Context, roleName string) error {
-	return e.ExecuteInTransaction(ctx, func() error {
+	err := e.ExecuteInTransaction(ctx, func() error {
 		users := e.roleMgr.GetUsers(roleName)
 		for _, u := range users {
 			e.roleMgr.DeleteLink(u, roleName)
@@ -1654,11 +1692,13 @@ func (e *Enforcer) TransactionalDeleteRole(ctx context.Context, roleName string)
 		_ = e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, 1, roleName)
 		_ = e.policy.RemoveFilteredPolicy(model.SectionPolicyDefinition, policy.PTypePolicy, 0, roleName)
 
-		e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypePolicy, nil, nil)
-		e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
-
 		return nil
 	})
+	// 事务提交成功后再通知：p+g 段合并为一次通知
+	if err == nil {
+		e.notifyPolicyChange(policy.EventTypePolicyRemoved, "", nil, nil)
+	}
+	return err
 }
 
 // ==================== Management API ====================

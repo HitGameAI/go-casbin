@@ -61,6 +61,20 @@ func newMemoryEnforcer(t *testing.T, modelPath string) *Enforcer {
 	return e
 }
 
+// newMemoryEnforcerB 用于 benchmark 的 enforcer 创建辅助函数
+// 使用 testing.TB 接口，兼容 *testing.T 和 *testing.B
+func newMemoryEnforcerB(tb testing.TB, modelPath string) *Enforcer {
+	tb.Helper()
+	e, err := NewEnforcer(
+		WithModelPath(modelPath),
+		WithAutoSave(true),
+	)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return e
+}
+
 func TestACLBasicEnforce(t *testing.T) {
 	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
 
