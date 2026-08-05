@@ -23,7 +23,15 @@ package enforcer
 import (
 	"net"
 	"strings"
+
+	"github.com/kamalyes/go-casbin/policy"
 )
+
+// TenantHostBinding 租户域名绑定关系
+type TenantHostBinding struct {
+	TenantID string
+	Host     string
+}
 
 const (
 	// domainIdentityAction 正向校验动作
@@ -94,12 +102,33 @@ func (e *Enforcer) ResolveTenantByHost(host string) (string, error) {
 		return "", nil
 	}
 	resource := domainIdentityResourcePrefix + host
-	for _, p := range e.GetFilteredNamedPolicy("p2", 2, resource, hostTenantMapAction) {
+	for _, p := range e.GetFilteredNamedPolicy(policy.PTypePolicy2, 2, resource, hostTenantMapAction) {
 		if len(p) > 1 && p[1] != "" {
 			return p[1], nil
 		}
 	}
 	return "", nil
+}
+
+// ListTenantHostBindings 列出租户域名绑定（反向映射策略）
+// tenantID 为空时列出所有租户的绑定，非空时仅列出指定租户的绑定
+func (e *Enforcer) ListTenantHostBindings(tenantID string) []TenantHostBinding {
+	bindings := make([]TenantHostBinding, 0)
+	for _, p := range e.GetFilteredNamedPolicy(policy.PTypePolicy2, 3, hostTenantMapAction) {
+		// p = [v0=sub_rule, v1=tenantID, v2=domain::host, v3=action]
+		if len(p) < 3 || p[1] == "" {
+			continue
+		}
+		if tenantID != "" && p[1] != tenantID {
+			continue
+		}
+		host := strings.TrimPrefix(p[2], domainIdentityResourcePrefix)
+		if host == "" {
+			continue
+		}
+		bindings = append(bindings, TenantHostBinding{TenantID: p[1], Host: host})
+	}
+	return bindings
 }
 
 // addTenantHostBinding 添加租户 host 绑定（正向+反向映射联动，幂等）
@@ -110,14 +139,14 @@ func (e *Enforcer) addTenantHostBinding(tenantID, host string) error {
 	}
 	resource := domainIdentityResourcePrefix + host
 	// 正向校验策略
-	if !e.HasNamedPolicy("p2", domainIdentitySubRule, tenantID, resource, domainIdentityAction) {
-		if err := e.AddNamedPolicy("p2", domainIdentitySubRule, tenantID, resource, domainIdentityAction); err != nil {
+	if !e.HasNamedPolicy(policy.PTypePolicy2, domainIdentitySubRule, tenantID, resource, domainIdentityAction) {
+		if err := e.AddNamedPolicy(policy.PTypePolicy2, domainIdentitySubRule, tenantID, resource, domainIdentityAction); err != nil {
 			return err
 		}
 	}
 	// 反向映射策略
-	if !e.HasNamedPolicy("p2", domainIdentitySubRule, tenantID, resource, hostTenantMapAction) {
-		if err := e.AddNamedPolicy("p2", domainIdentitySubRule, tenantID, resource, hostTenantMapAction); err != nil {
+	if !e.HasNamedPolicy(policy.PTypePolicy2, domainIdentitySubRule, tenantID, resource, hostTenantMapAction) {
+		if err := e.AddNamedPolicy(policy.PTypePolicy2, domainIdentitySubRule, tenantID, resource, hostTenantMapAction); err != nil {
 			return err
 		}
 	}
@@ -131,8 +160,8 @@ func (e *Enforcer) removeTenantHostBinding(tenantID, host string) error {
 		return nil
 	}
 	resource := domainIdentityResourcePrefix + host
-	if err := e.RemoveNamedPolicy("p2", domainIdentitySubRule, tenantID, resource, domainIdentityAction); err != nil {
+	if err := e.RemoveNamedPolicy(policy.PTypePolicy2, domainIdentitySubRule, tenantID, resource, domainIdentityAction); err != nil {
 		return err
 	}
-	return e.RemoveNamedPolicy("p2", domainIdentitySubRule, tenantID, resource, hostTenantMapAction)
+	return e.RemoveNamedPolicy(policy.PTypePolicy2, domainIdentitySubRule, tenantID, resource, hostTenantMapAction)
 }
