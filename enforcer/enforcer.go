@@ -301,6 +301,12 @@ func (e *Enforcer) EnforceContext(ctx context.Context, rvals ...interface{}) (bo
 		return false, errors.NewEnforcerNotReadyError(e.stateMachine.CurrentState())
 	}
 
+	// context 已取消时快速返回，避免在 RLock 或 matcher 上无谓阻塞
+	// 典型场景：gRPC 调用方 context 超时（gateway 3s deadline），此时 AC 服务应立即放弃处理
+	if ctx != nil && ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+
 	// Enforce 结果缓存：命中后 O(1) 返回，跳过 RLock+matcher
 	// 仅缓存全 string 的 rvals（ABAC 结构体不缓存）
 	// 版本号不匹配时视为失效（策略已变更），不返回旧结果
@@ -1892,6 +1898,14 @@ func (e *Enforcer) IsPublicPolicy(rvals ...interface{}) (bool, error) {
 	return e.Enforce(requestParams...)
 }
 
+// IsPublicPolicyCtx 检查指定路径和方法是否为公开接口（带 context）
+// 与 IsPublicPolicy 的区别：传入请求 context，使 EnforceContext 能感知 deadline/cancel
+// 当 gRPC 调用方 context 超时时，避免 AC 服务 goroutine 永久阻塞
+func (e *Enforcer) IsPublicPolicyCtx(ctx context.Context, rvals ...interface{}) (bool, error) {
+	requestParams := append([]interface{}{SubjectAnonymous}, rvals...)
+	return e.EnforceContext(ctx, requestParams...)
+}
+
 // GetPublicPolicies 获取当前配置的公开策略列表
 func (e *Enforcer) GetPublicPolicies() [][]string {
 	e.mu.RLock()
@@ -1912,6 +1926,13 @@ func (e *Enforcer) IsAuthSkipPolicy(rvals ...interface{}) (bool, error) {
 	// 将 authenticated 作为主体插入到请求参数的最前面
 	requestParams := append([]interface{}{SubjectAuthenticated}, rvals...)
 	return e.Enforce(requestParams...)
+}
+
+// IsAuthSkipPolicyCtx 检查指定路径和方法是否为认证免鉴权接口（带 context）
+// 与 IsAuthSkipPolicy 的区别：传入请求 context，使 EnforceContext 能感知 deadline/cancel
+func (e *Enforcer) IsAuthSkipPolicyCtx(ctx context.Context, rvals ...interface{}) (bool, error) {
+	requestParams := append([]interface{}{SubjectAuthenticated}, rvals...)
+	return e.EnforceContext(ctx, requestParams...)
 }
 
 // GetAuthSkipPolicies 获取当前配置的认证免鉴权策略列表
@@ -2262,6 +2283,13 @@ func (e *Enforcer) executeWithBreaker(fn func() (bool, error)) (bool, error) {
 func (e *Enforcer) doEnforce(ctx context.Context, rvals ...interface{}) (bool, error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+
+	// 获取 RLock 后检查 context：若等待锁期间 context 已超时，立即返回避免执行 matcher
+	// 注意：sync.RWMutex.RLock() 不支持 context，若写锁被长期持有此处仍会阻塞
+	// 但写锁释放后此检查能避免后续无意义的 matcher 计算
+	if ctx != nil && ctx.Err() != nil {
+		return false, ctx.Err()
+	}
 
 	var err error
 	defer syncx.RecoverToError(&err, func(r interface{}) {
