@@ -124,10 +124,13 @@ func (m *Model) GetValuesForFieldInPolicyAllTypes(section, field string) [][]str
 	return values
 }
 
+// deepCopyFunc 用于 Copy() 的深拷贝函数，默认为 syncx.DeepCopy
+var deepCopyFunc = syncx.DeepCopy
+
 func (m *Model) Copy() *Model {
 	newModel := NewModel(m.logger)
 	copied := make(map[string]*Assertion, len(m.assertions))
-	if err := syncx.DeepCopy(&copied, &m.assertions); err != nil {
+	if err := deepCopyFunc(&copied, &m.assertions); err != nil {
 		for k, v := range m.assertions {
 			copied[k] = v
 		}

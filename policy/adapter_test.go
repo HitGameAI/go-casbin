@@ -12,8 +12,10 @@
 package policy
 
 import (
+	"bufio"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -256,4 +258,128 @@ func TestSerializeDeserializePolicy(t *testing.T) {
 	decoded, err := DeserializePolicy[[]string](encoded)
 	require.NoError(t, err)
 	assert.Equal(t, data, decoded)
+}
+
+// ==================== writeLines 辅助函数测试 ====================
+
+// failingStringWriter 总是返回写入错误的 io.StringWriter
+type failingStringWriter struct{}
+
+func (fsw *failingStringWriter) WriteString(s string) (int, error) {
+	return 0, errWriteFailed
+}
+
+var errWriteFailed = newWriteError()
+
+func newWriteError() error { return bufio.ErrTooLong }
+
+func TestWriteLines_Error(t *testing.T) {
+	err := writeLines(&failingStringWriter{}, []string{"line1"})
+	assert.Error(t, err)
+}
+
+// ==================== FileAdapter 错误路径测试 ====================
+
+func TestFileAdapter_LoadPolicy_ScannerError(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "policy.csv")
+	// 创建超过 bufio.MaxScanTokenSize (64KB) 的超长行以触发 scanner.Err()
+	longLine := "p, " + strings.Repeat("x", bufio.MaxScanTokenSize)
+	err := os.WriteFile(path, []byte(longLine), 0644)
+	require.NoError(t, err)
+
+	fa := NewFileAdapter(path)
+	_, err = fa.LoadPolicy()
+	assert.Error(t, err)
+}
+
+func TestFileAdapter_RemovePolicy_LoadError(t *testing.T) {
+	fa := NewFileAdapter("/nonexistent/policy.csv")
+	err := fa.RemovePolicy("p, alice, data1, read")
+	assert.Error(t, err)
+}
+
+func TestFileAdapter_AddPolicies_OpenError(t *testing.T) {
+	fa := NewFileAdapter("/nonexistent-dir/policy.csv")
+	err := fa.AddPolicies([]string{"p, alice, data1, read"})
+	assert.Error(t, err)
+}
+
+func TestFileAdapter_RemovePolicies_LoadError(t *testing.T) {
+	fa := NewFileAdapter("/nonexistent/policy.csv")
+	err := fa.RemovePolicies([]string{"p, alice, data1, read"})
+	assert.Error(t, err)
+}
+
+func TestFileAdapter_UpdatePolicy_LoadError(t *testing.T) {
+	fa := NewFileAdapter("/nonexistent/policy.csv")
+	err := fa.UpdatePolicy("p, old, data, act", "p, new, data, act")
+	assert.Error(t, err)
+}
+
+func TestFileAdapter_UpdatePolicies_LoadError(t *testing.T) {
+	fa := NewFileAdapter("/nonexistent/policy.csv")
+	err := fa.UpdatePolicies([]string{"p, old, data, act"}, []string{"p, new, data, act"})
+	assert.Error(t, err)
+}
+
+func TestFileAdapter_UpdateFilteredPolicies_LoadError(t *testing.T) {
+	fa := NewFileAdapter("/nonexistent/policy.csv")
+	err := fa.UpdateFilteredPolicies([]string{"p, new, data, act"}, 0, "alice")
+	assert.Error(t, err)
+}
+
+func TestFileAdapter_UpdateFilteredPoliciesByPType(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "policy.csv")
+	fa := NewFileAdapter(path)
+	_ = fa.SavePolicy([]string{
+		"p, alice, data1, read",
+		"p, bob, data2, write",
+		"g, alice, admin",
+	})
+
+	// 按 ptype=p 和 fieldIndex=0(即 V0)、fieldValue=alice 过滤更新
+	err := fa.UpdateFilteredPoliciesByPType("p", []string{"p, alice, data3, exec"}, 0, "alice")
+	require.NoError(t, err)
+
+	policies, _ := fa.LoadPolicy()
+	// alice 的 p 策略被移除，追加了新策略；bob 和 g 保持不变
+	assert.Contains(t, policies, "p, bob, data2, write")
+	assert.Contains(t, policies, "g, alice, admin")
+	assert.Contains(t, policies, "p, alice, data3, exec")
+	assert.NotContains(t, policies, "p, alice, data1, read")
+}
+
+func TestFileAdapter_UpdateFilteredPoliciesByPType_LoadError(t *testing.T) {
+	fa := NewFileAdapter("/nonexistent/policy.csv")
+	err := fa.UpdateFilteredPoliciesByPType("p", []string{"p, alice, data3, exec"}, 0, "alice")
+	assert.Error(t, err)
+}
+
+func TestFileAdapter_LoadFilteredPolicy_LoadError(t *testing.T) {
+	fa := NewFileAdapter("/nonexistent/policy.csv")
+	_, err := fa.LoadFilteredPolicy([]string{"alice"})
+	assert.Error(t, err)
+}
+
+// ==================== MemoryAdapter 补充测试 ====================
+
+func TestMemoryAdapter_UpdateFilteredPoliciesByPType(t *testing.T) {
+	ma := NewMemoryAdapter()
+	_ = ma.SavePolicy([]string{
+		"p, alice, data1, read",
+		"p, bob, data2, write",
+		"g, alice, admin",
+	})
+
+	// 按 ptype=p 和 fieldIndex=0(即 V0)、fieldValue=alice 过滤更新
+	err := ma.UpdateFilteredPoliciesByPType("p", []string{"p, alice, data3, exec"}, 0, "alice")
+	require.NoError(t, err)
+
+	policies, _ := ma.LoadPolicy()
+	assert.Contains(t, policies, "p, bob, data2, write")
+	assert.Contains(t, policies, "g, alice, admin")
+	assert.Contains(t, policies, "p, alice, data3, exec")
+	assert.NotContains(t, policies, "p, alice, data1, read")
 }

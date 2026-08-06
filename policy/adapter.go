@@ -14,6 +14,7 @@ package policy
 import (
 	"bufio"
 	"context"
+	"io"
 	"os"
 	"strings"
 
@@ -172,6 +173,16 @@ func (fa *FileAdapter) LoadPolicy() ([]string, error) {
 	return policies, nil
 }
 
+// writeLines 将多行策略写入 StringWriter，写入失败时返回包装错误
+func writeLines(w io.StringWriter, lines []string) error {
+	for _, line := range lines {
+		if _, err := w.WriteString(line + "\n"); err != nil {
+			return errors.NewPolicyAdapterFailedError(err.Error())
+		}
+	}
+	return nil
+}
+
 // SavePolicy 将所有策略保存到文件（覆盖写入）
 func (fa *FileAdapter) SavePolicy(policies []string) error {
 	file, err := os.Create(fa.filePath)
@@ -179,13 +190,7 @@ func (fa *FileAdapter) SavePolicy(policies []string) error {
 		return errors.NewPolicyAdapterFailedError(err.Error())
 	}
 	defer file.Close()
-
-	for _, policy := range policies {
-		if _, err := file.WriteString(policy + "\n"); err != nil {
-			return errors.NewPolicyAdapterFailedError(err.Error())
-		}
-	}
-	return nil
+	return writeLines(file, policies)
 }
 
 // AddPolicy 追加单条策略到文件末尾
@@ -195,11 +200,7 @@ func (fa *FileAdapter) AddPolicy(line string) error {
 		return errors.NewPolicyAdapterFailedError(err.Error())
 	}
 	defer file.Close()
-
-	if _, err := file.WriteString(line + "\n"); err != nil {
-		return errors.NewPolicyAdapterFailedError(err.Error())
-	}
-	return nil
+	return writeLines(file, []string{line})
 }
 
 // RemovePolicy 从文件中删除单条策略
@@ -227,13 +228,7 @@ func (fa *FileAdapter) AddPolicies(lines []string) error {
 		return errors.NewPolicyAdapterFailedError(err.Error())
 	}
 	defer file.Close()
-
-	for _, line := range lines {
-		if _, err := file.WriteString(line + "\n"); err != nil {
-			return errors.NewPolicyAdapterFailedError(err.Error())
-		}
-	}
-	return nil
+	return writeLines(file, lines)
 }
 
 // RemovePolicies 批量从文件中删除策略
@@ -550,10 +545,7 @@ func (ma *MemoryAdapter) UpdateFilteredPoliciesByPType(ptype string, newLines []
 // LoadFilteredPolicy 按过滤条件从内存加载策略
 func (ma *MemoryAdapter) LoadFilteredPolicy(filter interface{}) ([]string, error) {
 	ma.filtered = true
-	policies, err := ma.LoadPolicy()
-	if err != nil {
-		return nil, err
-	}
+	policies := ma.policies
 
 	filterValues, ok := filter.([]string)
 	if !ok {

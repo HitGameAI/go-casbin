@@ -145,3 +145,17 @@ func TestOptionsChaining(t *testing.T) {
 	assert.Len(t, o.authSkipPolicies, 1)
 	assert.Equal(t, SubjectAuthenticated, o.authSkipPolicies[0][0])
 }
+
+func TestWithNormalizeHost(t *testing.T) {
+	o := defaultOptions()
+	fn := func(host string) string { return "normalized-" + host }
+	WithNormalizeHost(fn)(o)
+	assert.NotNil(t, o.normalizeHost)
+	assert.Equal(t, "normalized-example.com", o.normalizeHost("example.com"))
+}
+
+func TestWithNormalizeHost_Nil(t *testing.T) {
+	o := defaultOptions()
+	WithNormalizeHost(nil)(o)
+	assert.Nil(t, o.normalizeHost)
+}

@@ -1376,3 +1376,677 @@ func TestRemoveGroupingPolicy_WithDomain(t *testing.T) {
 	err = e.RemoveGroupingPolicy("charlie", "admin", "tenant1")
 	assert.NoError(t, err)
 }
+
+// ==================== NewEnforcer 错误路径测试 ====================
+
+// mockFailSubscribeNotifier Subscribe 总是失败
+type mockFailSubscribeNotifier struct{}
+
+func (m *mockFailSubscribeNotifier) Publish(ctx context.Context, event *policy.ChangeEvent) error {
+	return nil
+}
+func (m *mockFailSubscribeNotifier) Subscribe(ctx context.Context, handler policy.ChangeEventHandler) error {
+	return fmt.Errorf("subscribe failed")
+}
+func (m *mockFailSubscribeNotifier) Unsubscribe() error { return nil }
+func (m *mockFailSubscribeNotifier) Close() error       { return nil }
+
+func TestNewEnforcer_NotifierSubscribeFail(t *testing.T) {
+	e, err := NewEnforcer(
+		WithModelPath(rbacModelPath),
+		WithNotifier(&mockFailSubscribeNotifier{}),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, e)
+	defer e.Close()
+	// Subscribe 失败不应阻止创建，仅记录警告
+}
+
+// ==================== EnforceContext 错误路径测试 ====================
+
+func TestEnforceContext_StateNotReady(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// enabled=true 但状态机不在 Ready（手动切到 Error）
+	e.enabled = true
+	_ = e.stateMachine.TransitionTo(StateError)
+
+	_, err := e.EnforceContext(context.Background(), "alice", "data1", "read")
+	assert.Error(t, err)
+}
+
+func TestEnforceContext_CancelledContext(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := e.EnforceContext(ctx, "alice", "data1", "read")
+	assert.Error(t, err)
+}
+
+func TestEnforceContext_ABACNonString(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// 传入非 string 参数（int），不可缓存，走 enforceCore
+	ok, err := e.EnforceContext(context.Background(), 123, "data1", "read")
+	// 不会崩溃，结果为 false（123 != "alice"）
+	assert.NoError(t, err)
+	assert.False(t, ok)
+}
+
+// ==================== doEnforce / doEnforceWithMatcher 错误路径测试 ====================
+
+func TestDoEnforce_CancelledContext(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// doEnforce 在获取 RLock 后检查 ctx
+	e.mu.RLock()
+	_, err := e.doEnforce(ctx, "alice", "data1", "read")
+	e.mu.RUnlock()
+	assert.Error(t, err)
+}
+
+func TestDoEnforce_EmptyParams(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	_, err := e.doEnforce(context.Background())
+	assert.Error(t, err)
+}
+
+func TestDoEnforceWithMatcher_NilRequestTokens(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	// 手动清空 requestTokens 使 buildRequest 返回 nil
+	saved := e.requestTokens
+	e.requestTokens = nil
+	defer func() { e.requestTokens = saved }()
+
+	_, err := e.doEnforceWithMatcher(context.Background(), "r.sub == p.sub", "alice", "data1", "read")
+	assert.Error(t, err)
+}
+
+func TestDoEnforceWithMatcher_EmptyMatcherExpr(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	saved := e.matcherExpr
+	e.matcherExpr = ""
+	defer func() { e.matcherExpr = saved }()
+
+	_, err := e.doEnforceWithMatcher(context.Background(), "", "alice", "data1", "read")
+	assert.Error(t, err)
+}
+
+// ==================== enforceExWithMatcherExpr 错误路径测试 ====================
+
+func TestEnforceExWithMatcherExpr_ValidationError(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// 空字符串参数触发 validateRequest 错误
+	_, _, err := e.enforceExWithMatcherExpr("", "", "data1", "read")
+	assert.Error(t, err)
+}
+
+func TestEnforceExWithMatcherExpr_NilRequestTokens(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	saved := e.requestTokens
+	e.requestTokens = nil
+	defer func() { e.requestTokens = saved }()
+
+	_, _, err := e.enforceExWithMatcherExpr("r.sub == p.sub", "alice", "data1", "read")
+	assert.Error(t, err)
+}
+
+func TestEnforceExWithMatcherExpr_EmptyMatcherExpr(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	saved := e.matcherExpr
+	e.matcherExpr = ""
+	defer func() { e.matcherExpr = saved }()
+
+	_, _, err := e.enforceExWithMatcherExpr("", "alice", "data1", "read")
+	assert.Error(t, err)
+}
+
+// ==================== BatchEnforceWithMatcher 错误路径测试 ====================
+
+func TestBatchEnforceWithMatcher_Error(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// 参数数量不匹配触发错误
+	_, err := e.BatchEnforceWithMatcher("r.sub == p.sub", [][]interface{}{
+		{"alice"},
+	})
+	assert.Error(t, err)
+}
+
+// ==================== 策略操作错误路径测试 ====================
+
+func TestAddPolicy_Duplicate(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// 已存在的策略应返回错误
+	err := e.AddPolicy("alice", "data1", "read")
+	assert.Error(t, err)
+}
+
+func TestAddPolicy_ValidationError(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// 空字段触发 validatePolicyRule 错误
+	err := e.AddPolicy("", "data1", "read")
+	assert.Error(t, err)
+}
+
+func TestAddPolicies_ValidationError(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	err := e.AddPolicies([][]string{{"alice", "", "read"}})
+	assert.Error(t, err)
+}
+
+func TestAddPoliciesEx_AdapterError(t *testing.T) {
+	adapter := newAddFailAdapter()
+	e, err := NewEnforcer(WithModelPath(aclModelPath), WithAdapter(adapter), WithAutoSave(true))
+	require.NoError(t, err)
+	defer e.Close()
+
+	err = e.AddPoliciesEx([][]string{{"eve", "data3", "write"}})
+	assert.Error(t, err)
+}
+
+func TestAddNamedPolicy_AdapterError(t *testing.T) {
+	adapter := newAddFailAdapter()
+	e, err := NewEnforcer(WithModelPath(aclModelPath), WithAdapter(adapter), WithAutoSave(true))
+	require.NoError(t, err)
+	defer e.Close()
+
+	err = e.AddNamedPolicy("p", "eve", "data3", "write")
+	assert.Error(t, err)
+}
+
+func TestAddNamedPolicies_AdapterError(t *testing.T) {
+	adapter := newAddFailAdapter()
+	e, err := NewEnforcer(WithModelPath(aclModelPath), WithAdapter(adapter), WithAutoSave(true))
+	require.NoError(t, err)
+	defer e.Close()
+
+	err = e.AddNamedPolicies("p", [][]string{{"eve", "data3", "write"}})
+	assert.Error(t, err)
+}
+
+func TestAddNamedPoliciesEx_AdapterError(t *testing.T) {
+	adapter := newAddFailAdapter()
+	e, err := NewEnforcer(WithModelPath(aclModelPath), WithAdapter(adapter), WithAutoSave(true))
+	require.NoError(t, err)
+	defer e.Close()
+
+	err = e.AddNamedPoliciesEx("p", [][]string{{"eve", "data3", "write"}})
+	assert.Error(t, err)
+}
+
+func TestRemovePolicy_NotFound(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	err := e.RemovePolicy("nobody", "data3", "read")
+	assert.Error(t, err)
+}
+
+func TestRemovePolicies_NotFound(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// 批量删除不存在的策略不会报错（逐条跳过）
+	err := e.RemovePolicies([][]string{{"nobody", "data3", "read"}})
+	assert.NoError(t, err)
+}
+
+func TestRemoveFilteredNamedPolicy_NonExistentPType(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// 不存在的 ptype 导致 assertion nil
+	err := e.RemoveFilteredNamedPolicy("nonexistent", 0, "alice")
+	assert.Error(t, err)
+}
+
+func TestRemoveNamedPolicy_NotFound(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	err := e.RemoveNamedPolicy("p", "nobody", "data3", "read")
+	assert.Error(t, err)
+}
+
+func TestRemoveNamedPolicies_NotFound(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// 批量删除不存在的策略不会报错（逐条跳过）
+	err := e.RemoveNamedPolicies("p", [][]string{{"nobody", "data3", "read"}})
+	assert.NoError(t, err)
+}
+
+func TestUpdatePolicy_NotFound(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	err := e.UpdatePolicy([]string{"nobody", "data3", "read"}, []string{"nobody", "data3", "write"})
+	assert.Error(t, err)
+}
+
+func TestUpdatePolicies_NotFound(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// 批量更新不存在的策略不会报错（逐条跳过）
+	err := e.UpdatePolicies(
+		[][]string{{"nobody", "data3", "read"}},
+		[][]string{{"nobody", "data3", "write"}},
+	)
+	assert.NoError(t, err)
+}
+
+func TestUpdateFilteredPolicies_AdapterError(t *testing.T) {
+	adapter := newFailUpdateAdapter()
+	_ = adapter.SavePolicy([]string{"p, alice, data1, read"})
+
+	e, err := NewEnforcer(WithModelPath(aclModelPath), WithAdapter(adapter), WithAutoSave(true))
+	require.NoError(t, err)
+	defer e.Close()
+
+	err = e.UpdateFilteredPolicies(
+		[][]string{{"alice", "data1", "write"}},
+		0, "alice",
+	)
+	assert.Error(t, err)
+}
+
+// ==================== 分组策略错误路径测试 ====================
+
+func TestAddGroupingPolicies_AdapterError(t *testing.T) {
+	adapter := newAddFailAdapter()
+	e, err := NewEnforcer(WithModelPath(rbacModelPath), WithAdapter(adapter), WithAutoSave(true))
+	require.NoError(t, err)
+	defer e.Close()
+
+	err = e.AddGroupingPolicies([][]string{{"charlie", "viewer"}})
+	assert.Error(t, err)
+}
+
+func TestAddGroupingPoliciesEx_AdapterError(t *testing.T) {
+	adapter := newAddFailAdapter()
+	e, err := NewEnforcer(WithModelPath(rbacModelPath), WithAdapter(adapter), WithAutoSave(true))
+	require.NoError(t, err)
+	defer e.Close()
+
+	err = e.AddGroupingPoliciesEx([][]string{{"charlie", "viewer"}})
+	assert.Error(t, err)
+}
+
+func TestRemoveGroupingPolicy_NotFound(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	err := e.RemoveGroupingPolicy("nobody", "viewer")
+	assert.Error(t, err)
+}
+
+func TestRemoveGroupingPolicies_NotFound(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	// 批量删除不存在的分组策略不会报错（逐条跳过）
+	err := e.RemoveGroupingPolicies([][]string{{"nobody", "viewer"}})
+	assert.NoError(t, err)
+}
+
+func TestUpdateGroupingPolicy_NotFound(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	err := e.UpdateGroupingPolicy([]string{"nobody", "viewer"}, []string{"nobody", "editor"})
+	assert.Error(t, err)
+}
+
+func TestUpdateGroupingPolicies_NotFound(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	// 批量更新不存在的分组策略不会报错（逐条跳过）
+	err := e.UpdateGroupingPolicies(
+		[][]string{{"nobody", "viewer"}},
+		[][]string{{"nobody", "editor"}},
+	)
+	assert.NoError(t, err)
+}
+
+// ==================== RBAC API 错误路径测试 ====================
+
+func TestAddRoleForUser_DuplicateLink(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	// alice → admin 已存在，重复添加不会报错（HasLink 返回 true 时跳过）
+	err := e.AddRoleForUser("alice", "admin")
+	assert.NoError(t, err)
+}
+
+func TestDeleteRoleForUser_NotExists(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	// 删除不存在的角色链接不会报错（MemoryAdapter RemovePolicy 无副作用）
+	err := e.DeleteRoleForUser("nobody", "admin")
+	assert.NoError(t, err)
+}
+
+func TestDeleteUser_NoRoles(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	err := e.DeleteUser("nobody")
+	assert.NoError(t, err)
+}
+
+func TestDeleteRole_NotExists(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	err := e.DeleteRole("nonexistent_role")
+	assert.NoError(t, err)
+}
+
+// ==================== 域 API 错误路径测试 ====================
+
+func TestGetPermissionsForUserInDomain_NoAssertion(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// ACL 模型的 p 段没有 4 个字段，所有策略都被 len(p) < 4 过滤
+	perms := e.GetPermissionsForUserInDomain("alice", "tenant1")
+	assert.Empty(t, perms)
+}
+
+func TestGetPermissionsInDomains_EmptyQueries(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	perms := e.GetPermissionsInDomains(nil)
+	assert.Nil(t, perms)
+}
+
+// ==================== IsPublicPolicyCtx / IsAuthSkipPolicyCtx 测试 ====================
+
+func TestIsPublicPolicyCtx(t *testing.T) {
+	e, err := NewEnforcer(
+		WithModelPath(rbacModelPath),
+		WithPublicPolicies([][]string{{"/v1/login", "POST"}}),
+		WithAutoSave(true),
+	)
+	require.NoError(t, err)
+	defer e.Close()
+
+	ok, err := e.IsPublicPolicyCtx(context.Background(), "/v1/login", "POST")
+	assert.NoError(t, err)
+	assert.True(t, ok)
+}
+
+func TestIsAuthSkipPolicyCtx(t *testing.T) {
+	e, err := NewEnforcer(
+		WithModelPath(rbacModelPath),
+		WithAuthSkipPolicies([][]string{{"/v1/auth/me", "GET"}}),
+		WithAutoSave(true),
+	)
+	require.NoError(t, err)
+	defer e.Close()
+
+	ok, err := e.IsAuthSkipPolicyCtx(context.Background(), "/v1/auth/me", "GET")
+	assert.NoError(t, err)
+	assert.True(t, ok)
+}
+
+// ==================== NormalizeHost 测试 ====================
+
+func TestNormalizeHost_WithCustomFunc(t *testing.T) {
+	e, err := NewEnforcer(
+		WithModelPath(rbacModelPath),
+		WithNormalizeHost(func(h string) string { return "custom-" + h }),
+		WithAutoSave(true),
+	)
+	require.NoError(t, err)
+	defer e.Close()
+
+	assert.Equal(t, "custom-example.com", e.NormalizeHost("example.com"))
+}
+
+func TestNormalizeHost_NoCustomFunc(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	// 未设置自定义函数时直接返回原值
+	assert.Equal(t, "example.com", e.NormalizeHost("example.com"))
+}
+
+// ==================== SetAdapter / ExecuteInTransaction 测试 ====================
+
+func TestSetAdapter_TransactionalAdapter(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	ta := newMockTransactionalAdapter()
+	e.SetAdapter(ta)
+	// rootAdapter 应被设置
+	assert.NotNil(t, e.rootAdapter)
+}
+
+func TestExecuteInTransaction_FallbackTransactional(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// 手动设置 adapter 为 transactional 但清空 rootAdapter，走 fallback 路径
+	ta := newMockTransactionalAdapter()
+	e.policy.SetAdapter(ta)
+	e.rootAdapter = nil
+
+	executed := false
+	err := e.ExecuteInTransaction(context.Background(), func() error {
+		executed = true
+		return nil
+	})
+	assert.NoError(t, err)
+	assert.True(t, executed)
+}
+
+func TestExecuteInTransaction_NonTransactional(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// MemoryAdapter 不实现 TransactionalAdapter，走非事务路径
+	executed := false
+	err := e.ExecuteInTransaction(context.Background(), func() error {
+		executed = true
+		return nil
+	})
+	assert.NoError(t, err)
+	assert.True(t, executed)
+}
+
+// ==================== SelfAddPoliciesEx 错误路径测试 ====================
+
+func TestSelfAddPoliciesEx_ValidationError(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	err := e.SelfAddPoliciesEx("p", "p", [][]string{{"alice", "", "read"}})
+	assert.Error(t, err)
+}
+
+// ==================== handlePolicyChange 错误路径测试 ====================
+
+// loadFailAdapter LoadPolicy 总是失败
+type loadFailAdapter struct {
+	policy.MemoryAdapter
+}
+
+func (a *loadFailAdapter) LoadPolicy() ([]string, error) {
+	return nil, fmt.Errorf("load policy failed")
+}
+
+func TestHandlePolicyChange_ReloadError(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// 替换为会失败的 adapter
+	e.policy.SetAdapter(&loadFailAdapter{})
+
+	// 全量事件（PolicyReload）触发 ReloadPolicy，LoadPolicy 失败
+	event := policy.NewChangeEvent(policy.EventTypePolicyReload, "", "")
+	e.handlePolicyChange(event)
+	// handlePolicyChange 仅记录日志，不 panic 即可
+}
+
+func TestHandlePolicyChange_IncrementalError(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	e.policy.SetAdapter(&loadFailAdapter{})
+
+	// 增量事件触发 reloadPolicyForRemoteChange，LoadPolicy 失败
+	event := policy.NewChangeEvent(policy.EventTypePolicyAdded, "p", "")
+	e.handlePolicyChange(event)
+}
+
+// ==================== SetNotifier 测试 ====================
+
+func TestSetNotifier_Nil(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	err := e.SetNotifier(nil)
+	assert.NoError(t, err)
+}
+
+func TestSetNotifier_WithFailSubscribe(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	err := e.SetNotifier(&mockFailSubscribeNotifier{})
+	assert.Error(t, err)
+}
+
+// ==================== 内部方法覆盖率测试 ====================
+
+func TestReleaseRequest_Nil(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// nil request 不应 panic
+	e.releaseRequest(nil)
+}
+
+func TestNormalizeHTTPAction_Lowercase(t *testing.T) {
+	assert.Equal(t, "GET", normalizeHTTPAction("get"))
+	assert.Equal(t, "POST", normalizeHTTPAction("post"))
+	assert.Equal(t, "DELETE", normalizeHTTPAction("delete"))
+}
+
+func TestNormalizeHTTPAction_NonHTTP(t *testing.T) {
+	// 非 HTTP 动作直接返回
+	assert.Equal(t, "read", normalizeHTTPAction("read"))
+	assert.Equal(t, "write", normalizeHTTPAction("write"))
+}
+
+func TestNormalizeRequestValue_NonString(t *testing.T) {
+	// 非 string 值直接返回
+	val := normalizeRequestValue("r.sub", 123)
+	assert.Equal(t, 123, val)
+}
+
+func TestEvaluateEffect_NilAssertion(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// 手动清空 cachedPolicyAssertion 模拟 nil
+	saved := e.cachedPolicyAssertion
+	e.cachedPolicyAssertion = nil
+	e.model.GetAssertions()["p"] = nil
+	defer func() {
+		e.cachedPolicyAssertion = saved
+	}()
+
+	result, err := e.evaluateEffect()
+	assert.NoError(t, err)
+	assert.Equal(t, policy.EffectDenyResult, result)
+}
+
+func TestGetPolicyAssertion_FallbackSectionMatch(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// 正常情况下精确匹配 "p"
+	assertion := e.getPolicyAssertion()
+	assert.NotNil(t, assertion)
+}
+
+func TestInitCachedFields_NilAssertion(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	// 测试 effectIndex 在 nil assertion 时保持 -1
+	e.cachedPolicyAssertion = nil
+	e.effectIndex = -1
+	// 不应 panic
+	e.initCachedFields()
+}
+
+func TestLoadRoleLinks_CycleDetection(t *testing.T) {
+	e := newTestEnforcer(t, rbacModelPath, rbacPolicyPath)
+	defer e.Close()
+
+	// 手动添加循环角色关系（admin → admin 自环）
+	// loadRoleLinks 遇到循环检测错误时应记录日志而非 panic
+	_ = e.SelfAddPolicy("g", "g", []string{"admin", "admin"})
+	e.loadRoleLinks()
+}
+
+// ==================== enableAutoNotifyWatcher 测试 ====================
+
+func TestEnableAutoNotifyWatcher(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	e.EnableAutoNotifyWatcher(false)
+	e.EnableAutoNotifyWatcher(true)
+}
+
+func TestEnableAutoBuildRoleLinks(t *testing.T) {
+	e := newTestEnforcer(t, aclModelPath, aclPolicyPath)
+	defer e.Close()
+
+	e.EnableAutoBuildRoleLinks(false)
+	e.EnableAutoBuildRoleLinks(true)
+}

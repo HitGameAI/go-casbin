@@ -323,18 +323,26 @@ func TestSetNotifier_Replace(t *testing.T) {
 }
 
 // mockNotifier 用于测试的模拟通知器
+// 支持 handlerWG 模拟 NATS EventLoop 的 wg.Wait()：
+// Close 时等待正在执行的 handler 完成，用于检测 SetNotifier 死锁风险
 type mockNotifier struct {
 	subscribed bool
 	closed     bool
 	publishErr error
+	handler    policy.ChangeEventHandler
+	handlerWG  sync.WaitGroup
+	mu         sync.Mutex
 }
 
 func (m *mockNotifier) Publish(_ context.Context, _ *policy.ChangeEvent) error {
 	return m.publishErr
 }
 
-func (m *mockNotifier) Subscribe(_ context.Context, _ policy.ChangeEventHandler) error {
+func (m *mockNotifier) Subscribe(_ context.Context, handler policy.ChangeEventHandler) error {
+	m.mu.Lock()
+	m.handler = handler
 	m.subscribed = true
+	m.mu.Unlock()
 	return nil
 }
 
@@ -344,7 +352,24 @@ func (m *mockNotifier) Unsubscribe() error {
 
 func (m *mockNotifier) Close() error {
 	m.closed = true
+	// 模拟 EventLoop wg.Wait()：等待正在执行的 handler 完成
+	// 若调用方持锁调用 Close，handler 等 Lock → 死锁
+	m.handlerWG.Wait()
 	return nil
+}
+
+// triggerHandler 模拟 EventLoop 异步投递事件给 handler
+func (m *mockNotifier) triggerHandler(event *policy.ChangeEvent) {
+	m.handlerWG.Add(1)
+	go func() {
+		defer m.handlerWG.Done()
+		m.mu.Lock()
+		handler := m.handler
+		m.mu.Unlock()
+		if handler != nil {
+			handler(event)
+		}
+	}()
 }
 
 // ==================== notifyPolicyChange 测试 ====================

@@ -98,3 +98,82 @@ func TestPolicyWatcher_AddCallback(t *testing.T) {
 	pw.AddCallback(func() {})
 	assert.Len(t, pw.callbacks, 2)
 }
+
+func TestPolicyWatcher_CheckFileChange_StatError(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "policy.csv")
+	err := os.WriteFile(path, []byte("p, alice, data1, read\n"), 0644)
+	require.NoError(t, err)
+
+	pw := NewPolicyWatcher(path, 100*time.Millisecond, logger.NewLogger())
+	err = pw.Start()
+	require.NoError(t, err)
+	defer pw.Stop()
+
+	// 等待 watcher 完成初始启动
+	time.Sleep(200 * time.Millisecond)
+
+	// 删除文件，使 checkFileChange 中的 os.Stat 失败
+	_ = os.Remove(path)
+
+	// 等待至少一个检查周期，确保 checkFileChange 被调用并进入 stat 错误分支
+	time.Sleep(300 * time.Millisecond)
+
+	// 验证 watcher 仍在运行（stat 错误不会停止 watcher）
+	pw.mu.Lock()
+	running := pw.running
+	pw.mu.Unlock()
+	assert.True(t, running)
+}
+
+func TestPolicyWatcher_CallbackPanic(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "policy.csv")
+	err := os.WriteFile(path, []byte("p, alice, data1, read\n"), 0644)
+	require.NoError(t, err)
+
+	pw := NewPolicyWatcher(path, 100*time.Millisecond, logger.NewLogger())
+
+	// 注册一个会 panic 的回调
+	panicRecovered := make(chan struct{}, 1)
+	pw.AddCallback(func() {
+		panic("test panic")
+	})
+	// 注册一个正常回调验证后续回调仍能执行
+	normalCalled := make(chan struct{}, 1)
+	pw.AddCallback(func() {
+		select {
+		case normalCalled <- struct{}{}:
+		default:
+		}
+	})
+
+	err = pw.Start()
+	require.NoError(t, err)
+	defer pw.Stop()
+
+	// 等待 watcher 启动
+	time.Sleep(200 * time.Millisecond)
+
+	// 修改文件触发回调
+	newTime := time.Now().Add(1 * time.Second)
+	_ = os.Chtimes(path, newTime, newTime)
+	_ = os.WriteFile(path, []byte("p, bob, data2, write\n"), 0644)
+
+	// 等待回调执行（panic 应被 RecoverToError 恢复）
+	time.Sleep(500 * time.Millisecond)
+
+	// panic 被恢复后，正常回调仍应被调用
+	select {
+	case <-normalCalled:
+		// 成功
+	case <-time.After(3 * time.Second):
+		t.Fatal("normal callback was not triggered after panic recovery")
+	}
+
+	// 确保 panicRecovered 通道不会阻塞（仅用于语义标记）
+	select {
+	case <-panicRecovered:
+	default:
+	}
+}

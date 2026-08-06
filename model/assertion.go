@@ -75,7 +75,7 @@ func (a *Assertion) RemovePolicy(policy []string) bool {
 	}
 	a.Policies = append(a.Policies[:idx], a.Policies[idx+1:]...)
 	delete(a.PolicyMap, key)
-	a.rebuildPolicyMap()
+	a.RebuildPolicyMap()
 	return true
 }
 
@@ -90,8 +90,16 @@ func (a *Assertion) ClearPolicies() {
 	a.PolicyMap = make(map[string]int)
 }
 
-func (a *Assertion) rebuildPolicyMap() {
-	a.PolicyMap = make(map[string]int, len(a.Policies))
+// RebuildPolicyMap 重建 PolicyMap（用于批量修改 Policies 后一次性重建索引）
+// 导出方法：供 policy 层在 in-place 批量增删后调用，替代逐条 AddPolicy 的 N 次 strings.Join
+func (a *Assertion) RebuildPolicyMap() {
+	if a.PolicyMap == nil {
+		a.PolicyMap = make(map[string]int, len(a.Policies))
+	} else {
+		for k := range a.PolicyMap {
+			delete(a.PolicyMap, k)
+		}
+	}
 	for i, p := range a.Policies {
 		a.PolicyMap[strings.Join(p, ",")] = i
 	}

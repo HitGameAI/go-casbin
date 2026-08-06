@@ -109,3 +109,19 @@ func TestEffectEvaluator_Evaluate_InvalidExpr(t *testing.T) {
 	// 空表达式走默认评估
 	assert.Equal(t, EffectAllowResult, result)
 }
+
+// TestEffectEvaluator_SomeWhereP_DenyExpr 覆盖 some(where (p_eft == deny)) 表达式分支
+// 此时 evalMode=evalModeSomeWhereP, targetEffect=deny
+func TestEffectEvaluator_SomeWhereP_DenyExpr(t *testing.T) {
+	ee := NewEffectEvaluator("some(where (p_eft == deny))")
+
+	// effects 中含有 deny → 匹配 targetEffect=deny → 返回 Allow
+	result, err := ee.Evaluate([]string{"deny"})
+	assert.NoError(t, err)
+	assert.Equal(t, EffectAllowResult, result)
+
+	// effects 中不含 deny → 不匹配 → 返回 Deny
+	result, err = ee.Evaluate([]string{"allow"})
+	assert.NoError(t, err)
+	assert.Equal(t, EffectDenyResult, result)
+}

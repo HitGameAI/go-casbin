@@ -12,6 +12,7 @@
 package model
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -64,4 +65,27 @@ func TestSplitAssertionKey(t *testing.T) {
 	section, name = SplitAssertionKey("p2")
 	assert.Equal(t, "p2", section)
 	assert.Equal(t, "p2", name)
+}
+
+func TestParseModelFromText_EmptyKeyOrValue(t *testing.T) {
+	// key 为空或 value 为空的行应被跳过
+	text := `
+key1 = value1
+= value_without_key
+key2 = 
+key3 = value3
+`
+	assertions, err := ParseModelFromText(text)
+	require.NoError(t, err)
+	assert.NotNil(t, assertions["key1"])
+	assert.NotNil(t, assertions["key3"])
+	_, exists := assertions[""]
+	assert.False(t, exists)
+}
+
+func TestParseModelFromText_ScannerError(t *testing.T) {
+	// 创建超过 bufio.MaxScanTokenSize (64KB) 的行触发 scanner.Err()
+	longLine := strings.Repeat("a", 70000)
+	_, err := ParseModelFromText(longLine)
+	assert.Error(t, err)
 }

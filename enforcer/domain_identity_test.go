@@ -19,8 +19,10 @@
 package enforcer
 
 import (
+	"fmt"
 	"testing"
 
+	"github.com/kamalyes/go-casbin/policy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -384,4 +386,124 @@ func BenchmarkSyncTenantHostBindings_AddRemove(b *testing.B) {
 		_ = e.SyncTenantHostBindings("t001", []string{"bench.example.com"}, nil)
 		_ = e.SyncTenantHostBindings("t001", nil, []string{"bench.example.com"})
 	}
+}
+
+// ==================== ListTenantHostBindings 测试 ====================
+
+func TestListTenantHostBindings_All(t *testing.T) {
+	e := newDomainIdentityEnforcer(t)
+
+	require.NoError(t, e.SyncTenantHostBindings("t001", []string{"a.example.com"}, nil))
+	require.NoError(t, e.SyncTenantHostBindings("t002", []string{"b.example.com"}, nil))
+
+	bindings := e.ListTenantHostBindings("")
+	assert.Len(t, bindings, 2)
+}
+
+func TestListTenantHostBindings_FilterByTenant(t *testing.T) {
+	e := newDomainIdentityEnforcer(t)
+
+	require.NoError(t, e.SyncTenantHostBindings("t001", []string{"a.example.com"}, nil))
+	require.NoError(t, e.SyncTenantHostBindings("t002", []string{"b.example.com"}, nil))
+
+	bindings := e.ListTenantHostBindings("t001")
+	assert.Len(t, bindings, 1)
+	assert.Equal(t, "t001", bindings[0].TenantID)
+	assert.Equal(t, "a.example.com", bindings[0].Host)
+}
+
+func TestListTenantHostBindings_Empty(t *testing.T) {
+	e := newDomainIdentityEnforcer(t)
+
+	bindings := e.ListTenantHostBindings("")
+	assert.Empty(t, bindings)
+}
+
+func TestListTenantHostBindings_SkipsMalformed(t *testing.T) {
+	e := newDomainIdentityEnforcer(t)
+
+	require.NoError(t, e.SyncTenantHostBindings("t001", []string{"a.example.com"}, nil))
+
+	// 手动添加格式异常的 p2 策略（len < 3、空 tenantID、空 host）
+	_ = e.SelfAddPolicy("p", "p2", []string{domainIdentitySubRule, "", "domain::", hostTenantMapAction})
+	_ = e.SelfAddPolicy("p", "p2", []string{domainIdentitySubRule, "t001", "", hostTenantMapAction})
+
+	bindings := e.ListTenantHostBindings("")
+	// 只应返回正常的 1 条绑定（空 tenantID 和空 host 的条目被跳过）
+	assert.Len(t, bindings, 1)
+	assert.Equal(t, "a.example.com", bindings[0].Host)
+}
+
+// ==================== addTenantHostBinding / removeTenantHostBinding 边界测试 ====================
+
+func TestAddTenantHostBinding_EmptyParams(t *testing.T) {
+	e := newDomainIdentityEnforcer(t)
+
+	// 空 host 或 tenantID 应直接返回 nil（no-op）
+	assert.NoError(t, e.addTenantHostBinding("", "admin.example.com"))
+	assert.NoError(t, e.addTenantHostBinding("t001", ""))
+	assert.Empty(t, e.GetNamedPolicy("p2"))
+}
+
+func TestRemoveTenantHostBinding_EmptyParams(t *testing.T) {
+	e := newDomainIdentityEnforcer(t)
+
+	// 空 host 或 tenantID 应直接返回 nil（no-op）
+	assert.NoError(t, e.removeTenantHostBinding("", "admin.example.com"))
+	assert.NoError(t, e.removeTenantHostBinding("t001", ""))
+}
+
+// ==================== SyncTenantHostBindings 错误路径测试 ====================
+
+// addFailAdapter 的 AddPolicy 总是失败（用于测试 addTenantHostBinding 错误路径）
+type domainAddFailAdapter struct {
+	policy.MemoryAdapter
+}
+
+func (a *domainAddFailAdapter) AddPolicy(line string) error {
+	return fmt.Errorf("adapter add failed")
+}
+
+func TestSyncTenantHostBindings_AddError(t *testing.T) {
+	adapter := &domainAddFailAdapter{}
+	e, err := NewEnforcer(
+		WithModelText(domainIdentityModelText),
+		WithAdapter(adapter),
+		WithAutoSave(true),
+		WithEnabled(true),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { e.Close() })
+
+	// addTenantHostBinding 内部调用 AddNamedPolicy → adapter.AddPolicy 失败
+	err = e.SyncTenantHostBindings("t001", []string{"admin.example.com"}, nil)
+	assert.Error(t, err)
+}
+
+// removeFailAdapter 的 RemovePolicy 总是失败（用于测试 removeTenantHostBinding 错误路径）
+type domainRemoveFailAdapter struct {
+	policy.MemoryAdapter
+}
+
+func (a *domainRemoveFailAdapter) RemovePolicy(line string) error {
+	return fmt.Errorf("adapter remove failed")
+}
+
+func TestSyncTenantHostBindings_RemoveError(t *testing.T) {
+	adapter := &domainRemoveFailAdapter{}
+	e, err := NewEnforcer(
+		WithModelText(domainIdentityModelText),
+		WithAdapter(adapter),
+		WithAutoSave(true),
+		WithEnabled(true),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { e.Close() })
+
+	// 先添加绑定（MemoryAdapter 的 AddPolicy 正常工作）
+	require.NoError(t, e.SyncTenantHostBindings("t001", []string{"admin.example.com"}, nil))
+
+	// 移除时 adapter.RemovePolicy 失败
+	err = e.SyncTenantHostBindings("t001", nil, []string{"admin.example.com"})
+	assert.Error(t, err)
 }

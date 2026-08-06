@@ -2,7 +2,7 @@
  * @Author: kamalyes 501893067@qq.com
  * @Date: 2025-03-28 00:00:00
  * @LastEditors: kamalyes 501893067@qq.com
- * @LastEditTime: 2026-05-25 01:10:58
+ * @LastEditTime: 2026-08-07 02:08:57
  * @FilePath: \go-casbin\enforcer\matcher.go
  * @Description: 匹配引擎（基于 go-toolbox）
  *
@@ -15,12 +15,14 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/kamalyes/go-casbin/model"
 	"github.com/kamalyes/go-casbin/policy"
 	"github.com/kamalyes/go-casbin/role"
 	"github.com/kamalyes/go-logger"
 	"github.com/kamalyes/go-toolbox/pkg/safe"
+	"github.com/kamalyes/go-toolbox/pkg/syncx"
 )
 
 // MatchContext 匹配上下文
@@ -35,6 +37,7 @@ type MatchContext struct {
 	ShortCircuit  bool                      // 短路优化：匹配到 allow 后立即返回（适用于 some(where(p.eft==allow)) 模式）
 	HasEval       bool                      // 表达式是否包含 eval()（预计算，避免每条策略重复 strings.Contains）
 	HasGFunc      bool                      // 表达式是否包含 g()（预计算，避免每条策略重复 strings.Contains）
+	EffectIndex   int                       // p.eft 在 assertion.Tokens 中的索引（-1 表示无 eft 字段），extractEffect O(1)
 }
 
 // PolicySegment 策略段
@@ -50,8 +53,9 @@ type PolicySegment struct {
 //   - 角色匹配：RBAC 模式，通过 g(r.sub, p.sub) 判断角色继承
 //   - 表达式求值：ABAC 规则模式，通过 eval(p.sub_rule) 动态执行条件表达式
 type MatcherEngine struct {
-	logger      logger.ILogger
-	customFuncs map[string]BuiltinFunc
+	logger       logger.ILogger
+	customFuncs  map[string]BuiltinFunc
+	compileCache sync.Map // key: expr string, value: *compiledNode，避免每次 Match 重复编译表达式
 }
 
 // NewMatcherEngine 创建匹配器引擎
@@ -65,10 +69,19 @@ var gFuncRegex = regexp.MustCompile(`g\(([^,]+),\s*([^,)]+)(?:,\s*([^,)]+))?\)`)
 // evalRegex 匹配 eval() 函数调用，如 eval(p.sub_rule)
 var evalRegex = regexp.MustCompile(`eval\(([^)]+)\)`)
 
+// funcArgsPool 复用自定义函数调用的 args 切片，减少每条策略的堆分配
+// keyMatch3/regexMatch 等函数在每条策略评估时都会调用，pool 化后零分配
+var funcArgsPool = syncx.NewPool(func() []interface{} {
+	return make([]interface{}, 0, 4)
+})
+
 // Match 执行匹配，返回是否匹配以及匹配策略的效果列表
 // 核心匹配流程：
 //   - 如果有策略，遍历每条策略评估 matcher 表达式
 //   - 如果没有策略（纯 ABAC 属性匹配），直接用请求参数评估 matcher
+//
+// 性能优化：使用编译表达式（AST）替代每次 evalExpr 的递归字符串扫描
+// 表达式编译一次，缓存复用，每条策略只做 O(1) 树遍历求值
 func (me *MatcherEngine) Match(mc *MatchContext, matcherExpr string) (bool, []string, error) {
 	me.customFuncs = mc.CustomFuncs
 
@@ -79,17 +92,14 @@ func (me *MatcherEngine) Match(mc *MatchContext, matcherExpr string) (bool, []st
 		matchedEffects = make([]string, 0, len(mc.Policies))
 	}
 
-	// 预计算表达式特征，避免每条策略重复 strings.Contains
 	hasEval := mc.HasEval
-	_ = mc.HasGFunc // g() 特征由 evalExpr 内部处理
+	// EffectIndex 默认 0 与 p.eft 在 index 0 二义，始终从 assertion 重算确保正确
+	effectIdx := computeEffectIndex(mc.Assertion)
 
 	if len(mc.Policies) == 0 && len(mc.ExtraPolicies) == 0 {
 		vars := me.buildVariableMap(mc.Request, nil, nil)
-		expr := matcherExpr
-		if hasEval {
-			expr = me.expandEval(expr, vars)
-		}
-		if me.evalExpr(expr, vars, mc.RoleMgr) {
+		compiled := me.getCompiledExpr(matcherExpr)
+		if compiled.eval(me, vars, mc.RoleMgr) {
 			return true, []string{"allow"}, nil
 		}
 		return false, nil, nil
@@ -101,11 +111,13 @@ func (me *MatcherEngine) Match(mc *MatchContext, matcherExpr string) (bool, []st
 
 	// vars map 复用：无 eval() 场景，预构建含 request 字段的复用 map
 	// 每条策略只更新 p.* 字段（r.* 不变），省去 N 次 map 分配 + request 拷贝
-	// evalExpr/expandEval 只读 vars 不写，复用安全；有 eval() 时必须每条策略独立 vars（p.sub_rule 值不同）
+	// 编译表达式 eval 只读 vars 不写，复用安全；有 eval() 时必须每条策略独立 vars（p.sub_rule 值不同）
 	var reusableVars map[string]interface{}
 	if !hasEval {
 		reusableVars = me.buildVariableMap(mc.Request, nil, mc.Assertion)
 	}
+
+	compiled := me.getCompiledExpr(matcherExpr)
 
 	for _, p := range mc.Policies {
 		var vars map[string]interface{}
@@ -125,13 +137,8 @@ func (me *MatcherEngine) Match(mc *MatchContext, matcherExpr string) (bool, []st
 			}
 		}
 
-		expr := matcherExpr
-		if hasEval {
-			expr = me.expandEval(expr, vars)
-		}
-
-		if me.evalExpr(expr, vars, mc.RoleMgr) {
-			eft := me.extractEffect(p, mc.Assertion)
+		if compiled.eval(me, vars, mc.RoleMgr) {
+			eft := extractEffectFast(p, effectIdx)
 
 			// 短路优化：对于 some(where(p.eft==allow)) 模式，
 			// 匹配到第一条 allow 策略即可立即返回，无需遍历剩余策略
@@ -215,20 +222,19 @@ func (me *MatcherEngine) matchWithExtraPolicies(mc *MatchContext, matcherExpr st
 // 处理不包含额外策略段的 matcher 表达式，如 p.sub == alice
 //
 // 性能优化：与 Match 方法一致，无 eval() 场景复用 vars map，每条策略只更新 p.* 字段
+// 使用编译表达式（AST）替代每次 evalExpr 的递归字符串扫描
 func (me *MatcherEngine) matchSingleSegment(mc *MatchContext, expr string, policies [][]string, assertion *model.Assertion, matchedEffects []string) (bool, []string, error) {
 	if matchedEffects == nil {
 		matchedEffects = make([]string, 0)
 	}
 
 	hasEval := mc.HasEval
+	effectIdx := computeEffectIndex(assertion)
 
 	if len(policies) == 0 {
 		vars := me.buildVariableMap(mc.Request, nil, nil)
-		expandedExpr := expr
-		if hasEval {
-			expandedExpr = me.expandEval(expandedExpr, vars)
-		}
-		if me.evalExpr(expandedExpr, vars, mc.RoleMgr) {
+		compiled := me.getCompiledExpr(expr)
+		if compiled.eval(me, vars, mc.RoleMgr) {
 			return true, []string{"allow"}, nil
 		}
 		return false, nil, nil
@@ -240,6 +246,8 @@ func (me *MatcherEngine) matchSingleSegment(mc *MatchContext, expr string, polic
 	if !hasEval {
 		reusableVars = me.buildVariableMap(mc.Request, nil, assertion)
 	}
+
+	compiled := me.getCompiledExpr(expr)
 
 	for _, p := range policies {
 		var vars map[string]interface{}
@@ -256,12 +264,8 @@ func (me *MatcherEngine) matchSingleSegment(mc *MatchContext, expr string, polic
 			}
 		}
 
-		expandedExpr := expr
-		if hasEval {
-			expandedExpr = me.expandEval(expandedExpr, vars)
-		}
-		if me.evalExpr(expandedExpr, vars, mc.RoleMgr) {
-			eft := me.extractEffect(p, assertion)
+		if compiled.eval(me, vars, mc.RoleMgr) {
+			eft := extractEffectFast(p, effectIdx)
 			matchedEffects = append(matchedEffects, eft)
 
 			// 短路优化
@@ -682,4 +686,341 @@ func valueToString(v interface{}) string {
 	default:
 		return fmt.Sprintf("%v", val)
 	}
+}
+
+// ==================== 编译表达式（AST） ====================
+//
+// 传统 evalExpr 对每条策略递归字符串扫描（findTopLevelOps、strings.Index、strings.Contains），
+// N 条策略 = N 次完整表达式解析。编译表达式将解析结果缓存为 AST 树，
+// 每条策略只做 O(1) 树遍历求值，消除热路径上的所有字符串扫描开销
+//
+// 支持的表达式语法：
+//   - 逻辑运算：a && b, a || b
+//   - 比较运算：r.sub == p.sub, r.sub != p.sub
+//   - 角色函数：g(r.sub, p.sub), g(r.sub, p.sub, r.dom)
+//   - 自定义函数：keyMatch3(r.obj, p.obj) 等
+//   - eval 展开：eval(p.sub_rule) — 每条策略展开为不同子表达式，子表达式同样编译缓存
+//   - in 运算符：r.sub in ("alice","bob")
+//   - 括号分组：(a || b) && c
+
+// nodeKind 标识编译表达式的节点类型
+type nodeKind int
+
+const (
+	kindAnd     nodeKind = iota // a && b
+	kindOr                      // a || b
+	kindCompare                 // a == b, a != b
+	kindGFunc                   // g(name1, name2, [domain])
+	kindFunc                    // keyMatch3(r.obj, p.obj) 等自定义函数
+	kindIn                      // r.sub in ("a","b")
+	kindEval                    // eval(p.sub_rule) — 每条策略动态展开
+)
+
+// compiledNode 预编译表达式节点
+// 由 compileExpr 一次性解析表达式生成，eval 方法做 O(1) 树遍历求值
+type compiledNode struct {
+	kind  nodeKind
+	left  *compiledNode // and/or 的左子树
+	right *compiledNode // and/or 的右子树
+	// compare 节点
+	op       string // "==", "!="
+	leftTok  string // 左操作数 token（如 "r.sub"）
+	rightTok string // 右操作数 token（如 "p.sub" 或字面量）
+	// gFunc 节点（复用 leftTok/rightTok 作为 name1/name2）
+	gDomain string // 域 token，空表示无域
+	// func 节点
+	fnName string   // 函数名（如 "keyMatch3"）
+	fnArgs []string // 函数参数 token 列表
+	// eval 节点
+	evalVar string // eval 引用的变量名（如 "p.sub_rule"）
+	// in 节点（复用 leftTok 作为左值）
+	inItems []string // in 的候选项列表
+}
+
+// eval 求值编译表达式
+// vars: 变量映射表（r.* 和 p.* 字段）
+// roleMgr: 角色管理器（用于 g() 函数）
+// me: 匹配器引擎（用于 resolveValue 和 customFuncs 查找）
+// resolveVarInline 内联 map 查找，命中则直接返回，未命中 fallback 到 resolveValue
+// 99% 场景 token 直接在 vars 中（r.sub/p.obj 等），省去 resolveValue 函数调用开销
+// 仅 ABAC 嵌套属性（r.obj.Owner）走 resolveValue 的 strings.Split 逻辑
+func resolveVarInline(me *MatcherEngine, token string, vars map[string]interface{}) interface{} {
+	if val, ok := vars[token]; ok {
+		return val
+	}
+	return me.resolveValue(token, vars)
+}
+
+// toStringInline 内联 valueToString，string 类型直接断言返回，非 string 走 valueToString
+func toStringInline(val interface{}) string {
+	if s, ok := val.(string); ok {
+		return s
+	}
+	return valueToString(val)
+}
+
+func (n *compiledNode) eval(me *MatcherEngine, vars map[string]interface{}, roleMgr *role.RoleManager) bool {
+	switch n.kind {
+	case kindAnd:
+		return n.left.eval(me, vars, roleMgr) && n.right.eval(me, vars, roleMgr)
+	case kindOr:
+		return n.left.eval(me, vars, roleMgr) || n.right.eval(me, vars, roleMgr)
+	case kindCompare:
+		// 内联 map 查找 + valueToString：99% 场景零函数调用开销
+		left := toStringInline(resolveVarInline(me, n.leftTok, vars))
+		right := toStringInline(resolveVarInline(me, n.rightTok, vars))
+		if n.op == "==" {
+			return left == right
+		}
+		return left != right
+	case kindGFunc:
+		// 内联 map 查找 + valueToString
+		name1 := toStringInline(resolveVarInline(me, n.leftTok, vars))
+		name2 := toStringInline(resolveVarInline(me, n.rightTok, vars))
+		if n.gDomain != "" {
+			domain := toStringInline(resolveVarInline(me, n.gDomain, vars))
+			return me.evaluateRoleFunctionWithDomain(name1, name2, domain, roleMgr)
+		}
+		return me.evaluateRoleFunction(name1, name2, roleMgr)
+	case kindFunc:
+		fn, exists := me.customFuncs[n.fnName]
+		if !exists {
+			return false
+		}
+		// pool 复用 args 切片，减少每条策略的堆分配
+		args := funcArgsPool.Get()[:0]
+		for _, arg := range n.fnArgs {
+			args = append(args, resolveVarInline(me, arg, vars))
+		}
+		result, err := fn(args...)
+		funcArgsPool.Put(args)
+		if err != nil {
+			return false
+		}
+		if b, ok := result.(bool); ok {
+			return b
+		}
+		return false
+	case kindIn:
+		// 内联 map 查找 + valueToString
+		leftVal := toStringInline(resolveVarInline(me, n.leftTok, vars))
+		for _, item := range n.inItems {
+			if leftVal == item {
+				return true
+			}
+		}
+		return false
+	case kindEval:
+		// eval() 每条策略展开为不同子表达式，子表达式同样编译缓存后求值
+		val, ok := vars[n.evalVar]
+		if !ok {
+			return false
+		}
+		expanded := toStringInline(val)
+		if containsDangerousExpr(expanded) {
+			me.logger.WarnKV("Dangerous eval expression blocked", "value", expanded)
+			return false
+		}
+		return getCompiledEvalExpr(expanded).eval(me, vars, roleMgr)
+	}
+	return false
+}
+
+// evalCompileCache 缓存 eval 展开后的子表达式编译结果
+// key: 展开后的表达式字符串（如 r.sub == "alice"），value: *compiledNode
+// 相同 sub_rule 值的策略共享编译结果，避免重复解析
+var evalCompileCache sync.Map
+
+// getCompiledExpr 获取或编译表达式
+// 从 MatcherEngine.compileCache 查找，命中则直接返回，未命中则编译并缓存
+func (me *MatcherEngine) getCompiledExpr(expr string) *compiledNode {
+	if cached, ok := me.compileCache.Load(expr); ok {
+		return cached.(*compiledNode)
+	}
+	node := me.compileExpr(expr)
+	if node == nil {
+		// 无法编译的表达式降级为恒 false，避免 nil panic
+		node = &compiledNode{kind: kindCompare, op: "==", leftTok: "false", rightTok: "true"}
+	}
+	me.compileCache.Store(expr, node)
+	return node
+}
+
+// getCompiledEvalExpr 获取或编译 eval 展开后的子表达式
+// 使用全局 evalCompileCache，跨 MatchContext 共享
+func getCompiledEvalExpr(expanded string) *compiledNode {
+	if cached, ok := evalCompileCache.Load(expanded); ok {
+		return cached.(*compiledNode)
+	}
+	// eval 展开的子表达式用空 MatcherEngine 编译（compileExpr 不依赖引擎状态）
+	node := (&MatcherEngine{}).compileExpr(expanded)
+	if node == nil {
+		node = &compiledNode{kind: kindCompare, op: "==", leftTok: "false", rightTok: "true"}
+	}
+	evalCompileCache.Store(expanded, node)
+	return node
+}
+
+// compileExpr 编译表达式为 AST
+// 递归解析顶层 || 和 &&，叶子节点解析为 compare/gFunc/func/eval/in
+func (me *MatcherEngine) compileExpr(expr string) *compiledNode {
+	expr = strings.TrimSpace(expr)
+	if expr == "" {
+		return nil
+	}
+
+	// 去除最外层配对括号
+	expr = stripOuterParens(expr)
+
+	// 查找顶层 || 或 &&
+	orPos, andPos := me.findTopLevelOps(expr)
+	if orPos >= 0 {
+		return &compiledNode{
+			kind:  kindOr,
+			left:  me.compileExpr(expr[:orPos]),
+			right: me.compileExpr(expr[orPos+2:]),
+		}
+	}
+	if andPos >= 0 {
+		return &compiledNode{
+			kind:  kindAnd,
+			left:  me.compileExpr(expr[:andPos]),
+			right: me.compileExpr(expr[andPos+2:]),
+		}
+	}
+
+	// 叶子：g() 函数
+	if strings.HasPrefix(expr, "g(") && strings.HasSuffix(expr, ")") {
+		return me.compileGFunc(expr)
+	}
+
+	// 叶子：eval() 函数
+	if strings.HasPrefix(expr, "eval(") && strings.HasSuffix(expr, ")") {
+		varName := strings.TrimSpace(expr[5 : len(expr)-1])
+		return &compiledNode{kind: kindEval, evalVar: varName}
+	}
+
+	// 叶子：in 运算符（必须在 parseFunctionCall 之前，否则 r.sub in (...) 会被误识别为函数调用）
+	if strings.Contains(expr, " in ") {
+		return me.compileInExpr(expr)
+	}
+
+	// 叶子：自定义函数调用（keyMatch3、regexMatch 等）
+	if fnName, fnArgs, ok := me.parseFunctionCall(expr); ok {
+		return &compiledNode{kind: kindFunc, fnName: fnName, fnArgs: fnArgs}
+	}
+
+	// 叶子：== 比较
+	if idx := strings.Index(expr, "=="); idx >= 0 {
+		return &compiledNode{
+			kind:     kindCompare,
+			op:       "==",
+			leftTok:  strings.TrimSpace(expr[:idx]),
+			rightTok: strings.TrimSpace(expr[idx+2:]),
+		}
+	}
+
+	// 叶子：!= 比较
+	if idx := strings.Index(expr, "!="); idx >= 0 {
+		return &compiledNode{
+			kind:     kindCompare,
+			op:       "!=",
+			leftTok:  strings.TrimSpace(expr[:idx]),
+			rightTok: strings.TrimSpace(expr[idx+2:]),
+		}
+	}
+
+	// 无法识别的表达式，降级为恒 false
+	return &compiledNode{kind: kindCompare, op: "==", leftTok: "false", rightTok: "true"}
+}
+
+// compileGFunc 编译 g() 函数调用
+func (me *MatcherEngine) compileGFunc(expr string) *compiledNode {
+	matches := gFuncRegex.FindStringSubmatch(expr)
+	if len(matches) < 3 {
+		return &compiledNode{kind: kindCompare, op: "==", leftTok: "false", rightTok: "true"}
+	}
+	node := &compiledNode{
+		kind:     kindGFunc,
+		leftTok:  strings.TrimSpace(matches[1]),
+		rightTok: strings.TrimSpace(matches[2]),
+	}
+	if len(matches) >= 4 && matches[3] != "" {
+		node.gDomain = strings.TrimSpace(matches[3])
+	}
+	return node
+}
+
+// compileInExpr 编译 in 运算符表达式
+func (me *MatcherEngine) compileInExpr(expr string) *compiledNode {
+	inIdx := strings.Index(expr, " in ")
+	if inIdx < 0 {
+		return &compiledNode{kind: kindCompare, op: "==", leftTok: "false", rightTok: "true"}
+	}
+	leftTok := strings.TrimSpace(expr[:inIdx])
+	rightPart := strings.TrimSpace(expr[inIdx+4:])
+	if !strings.HasPrefix(rightPart, "(") || !strings.HasSuffix(rightPart, ")") {
+		return &compiledNode{kind: kindCompare, op: "==", leftTok: "false", rightTok: "true"}
+	}
+	inner := rightPart[1 : len(rightPart)-1]
+	rawItems := strings.Split(inner, ",")
+	items := make([]string, 0, len(rawItems))
+	for _, item := range rawItems {
+		item = strings.TrimSpace(item)
+		item = strings.Trim(item, `"'`)
+		items = append(items, item)
+	}
+	return &compiledNode{kind: kindIn, leftTok: leftTok, inItems: items}
+}
+
+// stripOuterParens 去除最外层配对括号
+// 如 (r.act == p.act || p.act == "*") → r.act == p.act || p.act == "*"
+func stripOuterParens(expr string) string {
+	for {
+		if !strings.HasPrefix(expr, "(") || !strings.HasSuffix(expr, ")") {
+			break
+		}
+		depth := 0
+		matched := true
+		for i, ch := range expr {
+			if ch == '(' {
+				depth++
+			} else if ch == ')' {
+				depth--
+			}
+			if depth == 0 && i < len(expr)-1 {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			expr = strings.TrimSpace(expr[1 : len(expr)-1])
+		} else {
+			break
+		}
+	}
+	return expr
+}
+
+// computeEffectIndex 计算 p.eft 在 assertion.Tokens 中的索引
+// 返回 -1 表示无 eft 字段，extractEffectFast 据此做 O(1) 提取
+func computeEffectIndex(assertion *model.Assertion) int {
+	if assertion == nil {
+		return -1
+	}
+	for i, token := range assertion.Tokens {
+		if token == "p.eft" {
+			return i
+		}
+	}
+	return -1
+}
+
+// extractEffectFast O(1) 效果提取（使用预计算的索引）
+// 替代 extractEffect 的 O(n) token 遍历，热路径上每条匹配策略都调用
+func extractEffectFast(policyLine []string, effectIdx int) string {
+	if effectIdx >= 0 && effectIdx < len(policyLine) {
+		return policyLine[effectIdx]
+	}
+	return "allow"
 }

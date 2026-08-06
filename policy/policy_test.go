@@ -1208,3 +1208,262 @@ func (aara *addAfterRemoveAdapter) AddPolicy(line string) error {
 func (aara *addAfterRemoveAdapter) RemovePolicy(line string) error {
 	return nil
 }
+
+// ==================== 补充适配器类型 ====================
+
+// removeFailBasicAdapter 只实现 Adapter，RemovePolicy 总是失败（不实现 BatchAdapter/UpdatableAdapter）
+type removeFailBasicAdapter struct {
+	policies []string
+}
+
+func (a *removeFailBasicAdapter) LoadPolicy() ([]string, error) { return a.policies, nil }
+func (a *removeFailBasicAdapter) SavePolicy(p []string) error   { a.policies = p; return nil }
+func (a *removeFailBasicAdapter) AddPolicy(line string) error   { a.policies = append(a.policies, line); return nil }
+func (a *removeFailBasicAdapter) RemovePolicy(line string) error {
+	return errors.NewPolicyAdapterFailedError("remove failed")
+}
+
+// updatableOnlyFailAdapter 实现 UpdatableAdapter 但不实现 PTypeUpdatableAdapter
+type updatableOnlyFailAdapter struct {
+	failUpdateFiltered bool
+}
+
+func (a *updatableOnlyFailAdapter) LoadPolicy() ([]string, error)                  { return nil, nil }
+func (a *updatableOnlyFailAdapter) SavePolicy(policies []string) error             { return nil }
+func (a *updatableOnlyFailAdapter) AddPolicy(line string) error                    { return nil }
+func (a *updatableOnlyFailAdapter) RemovePolicy(line string) error                 { return nil }
+func (a *updatableOnlyFailAdapter) UpdatePolicy(oldLine, newLine string) error     { return nil }
+func (a *updatableOnlyFailAdapter) UpdatePolicies(oldLines, newLines []string) error { return nil }
+func (a *updatableOnlyFailAdapter) UpdateFilteredPolicies(newLines []string, fieldIndex int, fieldValues ...string) error {
+	if a.failUpdateFiltered {
+		return errors.NewPolicyAdapterFailedError("update filtered failed")
+	}
+	return nil
+}
+
+// filteredFailAdapter 实现 FilteredAdapter，LoadFilteredPolicy 总是失败
+type filteredFailAdapter struct {
+	MemoryAdapter
+}
+
+func (a *filteredFailAdapter) LoadFilteredPolicy(filter interface{}) ([]string, error) {
+	return nil, errors.NewPolicyAdapterFailedError("filtered load failed")
+}
+
+func (a *filteredFailAdapter) IsFiltered() bool { return true }
+
+// ==================== LoadPolicy / LoadFilteredPolicy / SavePolicy 补充测试 ====================
+
+func TestPolicy_LoadPolicy_WithPolicies(t *testing.T) {
+	adapter := NewMemoryAdapter()
+	_ = adapter.SavePolicy([]string{"p, alice, data1, read", "p, bob, data2, write"})
+	p := newTestPolicyWithAdapter(t, adapter)
+	err := p.LoadPolicy()
+	require.NoError(t, err)
+	assert.True(t, p.HasPolicy("p", []string{"alice", "data1", "read"}))
+	assert.True(t, p.HasPolicy("p", []string{"bob", "data2", "write"}))
+}
+
+func TestPolicy_LoadFilteredPolicy_Error(t *testing.T) {
+	adapter := &filteredFailAdapter{}
+	p := newTestPolicyWithAdapter(t, adapter)
+	err := p.LoadFilteredPolicy(nil)
+	assert.Error(t, err)
+}
+
+func TestPolicy_SavePolicy_AdapterError(t *testing.T) {
+	adapter := newBasicAdapter()
+	adapter.failSave = true
+	p := newTestPolicyWithAdapter(t, adapter)
+	err := p.AddPolicy("", "p", []string{"alice", "data1", "read"})
+	require.NoError(t, err)
+	err = p.SavePolicy()
+	assert.Error(t, err)
+}
+
+// ==================== 断言 nil (ptype 不存在) 补充测试 ====================
+
+func TestPolicy_AddPolicies_NotFoundType(t *testing.T) {
+	p := newTestPolicy(t)
+	err := p.AddPolicies("", "p2", [][]string{{"alice", "data1", "read"}})
+	assert.Error(t, err)
+}
+
+func TestPolicy_RemovePolicy_NotFoundType(t *testing.T) {
+	p := newTestPolicy(t)
+	err := p.RemovePolicy("", "p2", []string{"alice", "data1", "read"})
+	assert.Error(t, err)
+}
+
+func TestPolicy_UpdatePolicy_NotFoundType(t *testing.T) {
+	p := newTestPolicy(t)
+	err := p.UpdatePolicy("", "p2", []string{"alice", "data1", "read"}, []string{"bob", "data2", "write"})
+	assert.Error(t, err)
+}
+
+func TestPolicy_UpdatePolicies_NotFoundType(t *testing.T) {
+	p := newTestPolicy(t)
+	err := p.UpdatePolicies("", "p2",
+		[][]string{{"alice", "data1", "read"}},
+		[][]string{{"bob", "data2", "write"}},
+	)
+	assert.Error(t, err)
+}
+
+// ==================== RemovePolicy 适配器错误回滚测试 ====================
+
+func TestPolicy_RemovePolicy_AdapterRemoveError_Rollback(t *testing.T) {
+	adapter := &removeFailAdapter{}
+	p := newTestPolicyWithAdapter(t, adapter)
+
+	err := p.AddPolicy("", "p", []string{"alice", "data1", "read"})
+	require.NoError(t, err)
+
+	err = p.RemovePolicy("", "p", []string{"alice", "data1", "read"})
+	assert.Error(t, err)
+	// 回滚后策略应恢复
+	assert.True(t, p.HasPolicy("p", []string{"alice", "data1", "read"}))
+}
+
+// ==================== RemovePolicies 非 BatchAdapter 错误回滚测试 ====================
+
+func TestPolicy_RemovePolicies_NonBatchAdapter_RemoveError(t *testing.T) {
+	adapter := &removeFailBasicAdapter{}
+	p := newTestPolicyWithAdapter(t, adapter)
+
+	// 使用非 BatchAdapter 路径添加策略
+	p.model.GetAssertion("p").AddPolicy([]string{"alice", "data1", "read"})
+	p.model.GetAssertion("p").AddPolicy([]string{"bob", "data2", "write"})
+
+	err := p.RemovePolicies("", "p", [][]string{
+		{"alice", "data1", "read"},
+		{"bob", "data2", "write"},
+	})
+	assert.Error(t, err)
+	// 回滚后策略应恢复
+	assert.True(t, p.HasPolicy("p", []string{"alice", "data1", "read"}))
+	assert.True(t, p.HasPolicy("p", []string{"bob", "data2", "write"}))
+}
+
+// ==================== RemoveFilteredPolicy UpdatableAdapter 错误回滚测试 ====================
+
+func TestPolicy_RemoveFilteredPolicy_OnlyUpdatableAdapterError(t *testing.T) {
+	adapter := &updatableOnlyFailAdapter{failUpdateFiltered: true}
+	p := newTestPolicyWithAdapter(t, adapter)
+
+	p.model.GetAssertion("p").AddPolicy([]string{"alice", "data1", "read"})
+	p.model.GetAssertion("p").AddPolicy([]string{"alice", "data2", "write"})
+
+	err := p.RemoveFilteredPolicy("", "p", 0, "alice")
+	assert.Error(t, err)
+	// 回滚后策略应恢复
+	assert.True(t, p.HasPolicy("p", []string{"alice", "data1", "read"}))
+	assert.True(t, p.HasPolicy("p", []string{"alice", "data2", "write"}))
+}
+
+// ==================== UpdateFilteredPolicies 测试 ====================
+
+func TestPolicy_UpdateFilteredPolicies(t *testing.T) {
+	p := newTestPolicy(t)
+	_ = p.AddPolicies("", "p", [][]string{
+		{"alice", "data1", "read"},
+		{"bob", "data2", "write"},
+	})
+
+	err := p.UpdateFilteredPolicies("", "p", [][]string{{"carol", "data3", "exec"}}, 0, "alice")
+	require.NoError(t, err)
+	assert.False(t, p.HasPolicy("p", []string{"alice", "data1", "read"}))
+	assert.True(t, p.HasPolicy("p", []string{"carol", "data3", "exec"}))
+	assert.True(t, p.HasPolicy("p", []string{"bob", "data2", "write"}))
+}
+
+func TestPolicy_UpdateFilteredPolicies_BasicAdapter(t *testing.T) {
+	adapter := newBasicAdapter()
+	p := newTestPolicyWithAdapter(t, adapter)
+	_ = p.AddPolicies("", "p", [][]string{
+		{"alice", "data1", "read"},
+		{"bob", "data2", "write"},
+	})
+
+	err := p.UpdateFilteredPolicies("", "p", [][]string{{"carol", "data3", "exec"}}, 0, "alice")
+	require.NoError(t, err)
+	assert.False(t, p.HasPolicy("p", []string{"alice", "data1", "read"}))
+	assert.True(t, p.HasPolicy("p", []string{"carol", "data3", "exec"}))
+}
+
+func TestPolicy_UpdateFilteredPolicies_UpdatableOnlyAdapter(t *testing.T) {
+	adapter := &updatableOnlyFailAdapter{}
+	p := newTestPolicyWithAdapter(t, adapter)
+	p.model.GetAssertion("p").AddPolicy([]string{"alice", "data1", "read"})
+	p.model.GetAssertion("p").AddPolicy([]string{"bob", "data2", "write"})
+
+	err := p.UpdateFilteredPolicies("", "p", [][]string{{"carol", "data3", "exec"}}, 0, "alice")
+	require.NoError(t, err)
+	assert.False(t, p.HasPolicy("p", []string{"alice", "data1", "read"}))
+	assert.True(t, p.HasPolicy("p", []string{"carol", "data3", "exec"}))
+	assert.True(t, p.HasPolicy("p", []string{"bob", "data2", "write"}))
+}
+
+func TestPolicy_UpdateFilteredPolicies_NotFoundType(t *testing.T) {
+	p := newTestPolicy(t)
+	err := p.UpdateFilteredPolicies("", "p2", [][]string{{"alice", "data1", "read"}}, 0, "alice")
+	assert.Error(t, err)
+}
+
+func TestPolicy_UpdateFilteredPolicies_PTypeUpdatableAdapterError(t *testing.T) {
+	fua := newFailingUpdatableAdapter()
+	fua.failUpdateFilteredPolicies = true
+	p := newTestPolicyWithAdapter(t, fua)
+	_ = p.AddPolicies("", "p", [][]string{{"alice", "data1", "read"}})
+
+	err := p.UpdateFilteredPolicies("", "p", [][]string{{"bob", "data2", "write"}}, 0, "alice")
+	assert.Error(t, err)
+	// 回滚后旧策略应恢复
+	assert.True(t, p.HasPolicy("p", []string{"alice", "data1", "read"}))
+	assert.False(t, p.HasPolicy("p", []string{"bob", "data2", "write"}))
+}
+
+func TestPolicy_UpdateFilteredPolicies_UpdatableOnlyAdapterError(t *testing.T) {
+	adapter := &updatableOnlyFailAdapter{failUpdateFiltered: true}
+	p := newTestPolicyWithAdapter(t, adapter)
+	p.model.GetAssertion("p").AddPolicy([]string{"alice", "data1", "read"})
+
+	err := p.UpdateFilteredPolicies("", "p", [][]string{{"bob", "data2", "write"}}, 0, "alice")
+	assert.Error(t, err)
+	// 回滚后旧策略应恢复
+	assert.True(t, p.HasPolicy("p", []string{"alice", "data1", "read"}))
+	assert.False(t, p.HasPolicy("p", []string{"bob", "data2", "write"}))
+}
+
+func TestPolicy_UpdateFilteredPolicies_SavePolicyError(t *testing.T) {
+	adapter := newBasicAdapter()
+	adapter.failSave = true
+	p := newTestPolicyWithAdapter(t, adapter)
+	p.model.GetAssertion("p").AddPolicy([]string{"alice", "data1", "read"})
+
+	err := p.UpdateFilteredPolicies("", "p", [][]string{{"bob", "data2", "write"}}, 0, "alice")
+	assert.Error(t, err)
+	// 回滚后旧策略应恢复
+	assert.True(t, p.HasPolicy("p", []string{"alice", "data1", "read"}))
+}
+
+// ==================== UpdatePolicies 非 UpdatableAdapter 多策略 AddPolicy 失败回滚测试 ====================
+
+func TestPolicy_UpdatePolicies_NonUpdatableAdapter_MultipleNew_AddFail(t *testing.T) {
+	adapter := &addAfterRemoveAdapter{}
+	p := newTestPolicyWithAdapter(t, adapter)
+
+	// 直接在模型中添加旧策略，避免消耗 addCount
+	p.model.GetAssertion("p").AddPolicy([]string{"alice", "data1", "read"})
+
+	// 更新为两条新策略：第一条 AddPolicy 成功(addCount=1)，第二条失败(addCount=2)
+	err := p.UpdatePolicies("", "p",
+		[][]string{{"alice", "data1", "read"}},
+		[][]string{{"bob", "data2", "write"}, {"carol", "data3", "exec"}},
+	)
+	assert.Error(t, err)
+	// 回滚后旧策略应恢复
+	assert.True(t, p.HasPolicy("p", []string{"alice", "data1", "read"}))
+	assert.False(t, p.HasPolicy("p", []string{"bob", "data2", "write"}))
+	assert.False(t, p.HasPolicy("p", []string{"carol", "data3", "exec"}))
+}

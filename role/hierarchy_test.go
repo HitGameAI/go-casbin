@@ -184,6 +184,18 @@ func TestRoleHierarchy_HasLink_NonExistentRole(t *testing.T) {
 	assert.False(t, rh.HasLink("nonexistent", "admin"))
 }
 
+func TestRoleHierarchy_HasLink_VisitedNodeRevisit(t *testing.T) {
+	rh := newTestHierarchy()
+	// 构建菱形继承：a → b → d，a → c → d
+	// 搜索不存在的目标时，DFS 会两次到达 d，第二次触发 visited 检查
+	_ = rh.AddLink("a", "b")
+	_ = rh.AddLink("a", "c")
+	_ = rh.AddLink("b", "d")
+	_ = rh.AddLink("c", "d")
+
+	assert.False(t, rh.HasLink("a", "nonexistent"))
+}
+
 func TestRoleHierarchy_GetDomains_NoDomains(t *testing.T) {
 	rh := newTestHierarchy()
 	_ = rh.AddLink("alice", "admin")

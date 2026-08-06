@@ -13,6 +13,7 @@ package policy
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -22,21 +23,21 @@ import (
 type RiskLevel string
 
 const (
-	RiskLevelLow      RiskLevel = "low"       // 低风险：正常访问
-	RiskLevelMedium   RiskLevel = "medium"    // 中风险：需要二次验证
-	RiskLevelHigh     RiskLevel = "high"      // 高风险：需要人工审核
-	RiskLevelCritical RiskLevel = "critical"  // 极高风险：立即拦截
+	RiskLevelLow      RiskLevel = "low"      // 低风险：正常访问
+	RiskLevelMedium   RiskLevel = "medium"   // 中风险：需要二次验证
+	RiskLevelHigh     RiskLevel = "high"     // 高风险：需要人工审核
+	RiskLevelCritical RiskLevel = "critical" // 极高风险：立即拦截
 )
 
 // RiskEventType 风控事件类型
 type RiskEventType string
 
 const (
-	RiskEventLogin       RiskEventType = "login"        // 登录事件
-	RiskEventAccess      RiskEventType = "access"       // 访问事件
-	RiskEventTransaction RiskEventType = "transaction"  // 交易事件
-	RiskEventAPI         RiskEventType = "api"          // API 调用事件
-	RiskEventBatch       RiskEventType = "batch"        // 批量操作事件
+	RiskEventLogin       RiskEventType = "login"       // 登录事件
+	RiskEventAccess      RiskEventType = "access"      // 访问事件
+	RiskEventTransaction RiskEventType = "transaction" // 交易事件
+	RiskEventAPI         RiskEventType = "api"         // API 调用事件
+	RiskEventBatch       RiskEventType = "batch"       // 批量操作事件
 )
 
 // RiskEvent 风控事件
@@ -87,25 +88,25 @@ func (re *RiskEvent) WithContext(key string, value interface{}) *RiskEvent {
 
 // RiskAssessment 风控评估结果
 type RiskAssessment struct {
-	EventID    string            // 关联的事件 ID
-	Level      RiskLevel         // 风险等级
-	Score      float64           // 风险分数（0-100，越高越危险）
-	Reason     string            // 风险原因描述
-	Rules      []string          // 触发的规则列表
-	Action     RiskAction        // 建议动作
-	ExpireAt   time.Time         // 评估结果过期时间
-	Metadata   map[string]string // 扩展元数据
+	EventID  string            // 关联的事件 ID
+	Level    RiskLevel         // 风险等级
+	Score    float64           // 风险分数（0-100，越高越危险）
+	Reason   string            // 风险原因描述
+	Rules    []string          // 触发的规则列表
+	Action   RiskAction        // 建议动作
+	ExpireAt time.Time         // 评估结果过期时间
+	Metadata map[string]string // 扩展元数据
 }
 
 // RiskAction 风控建议动作
 type RiskAction string
 
 const (
-	RiskActionAllow    RiskAction = "allow"     // 允许通过
-	RiskActionVerify   RiskAction = "verify"    // 需要二次验证（短信/邮箱/人脸）
-	RiskActionChallenge RiskAction = "challenge" // 人机验证（验证码）
-	RiskActionReview   RiskAction = "review"    // 人工审核
-	RiskActionBlock    RiskAction = "block"     // 直接拦截
+	RiskActionAllow      RiskAction = "allow"      // 允许通过
+	RiskActionVerify     RiskAction = "verify"     // 需要二次验证（短信/邮箱/人脸）
+	RiskActionChallenge  RiskAction = "challenge"  // 人机验证（验证码）
+	RiskActionReview     RiskAction = "review"     // 人工审核
+	RiskActionBlock      RiskAction = "block"      // 直接拦截
 	RiskActionQuarantine RiskAction = "quarantine" // 隔离观察
 )
 
@@ -263,11 +264,11 @@ type BlacklistManager interface {
 
 // BlacklistEntry 黑名单条目
 type BlacklistEntry struct {
-	Subject   string    // 主体标识
-	Reason    string    // 拉黑原因
-	AddedAt   time.Time // 添加时间
-	ExpireAt  time.Time // 过期时间（零值表示永久）
-	AddedBy   string    // 操作人
+	Subject  string    // 主体标识
+	Reason   string    // 拉黑原因
+	AddedAt  time.Time // 添加时间
+	ExpireAt time.Time // 过期时间（零值表示永久）
+	AddedBy  string    // 操作人
 }
 
 // IsExpired 判断黑名单条目是否已过期
@@ -285,7 +286,9 @@ func (be *BlacklistEntry) IsExpired() bool {
 type RiskCallback func(assessment *RiskAssessment, event *RiskEvent)
 
 // RiskCallbackRegistry 风控回调注册表
+// 并发安全：Register 写入和 Trigger 读取通过 RWMutex 互斥
 type RiskCallbackRegistry struct {
+	mu        sync.RWMutex
 	callbacks map[RiskLevel][]RiskCallback
 }
 
@@ -298,11 +301,16 @@ func NewRiskCallbackRegistry() *RiskCallbackRegistry {
 
 // Register 注册指定风险等级的回调
 func (rcr *RiskCallbackRegistry) Register(level RiskLevel, callback RiskCallback) {
+	rcr.mu.Lock()
+	defer rcr.mu.Unlock()
 	rcr.callbacks[level] = append(rcr.callbacks[level], callback)
 }
 
 // Trigger 触发指定风险等级的所有回调
+// 回调在 RLock 持有期间执行，回调内禁止调用 Register（会自死锁）
 func (rcr *RiskCallbackRegistry) Trigger(assessment *RiskAssessment, event *RiskEvent) {
+	rcr.mu.RLock()
+	defer rcr.mu.RUnlock()
 	callbacks, ok := rcr.callbacks[assessment.Level]
 	if !ok {
 		return

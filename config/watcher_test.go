@@ -133,3 +133,18 @@ func TestConfigWatcher_CheckChange_InvalidContent(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	// 不应 panic
 }
+
+func TestConfigWatcher_CheckChange_LoadError(t *testing.T) {
+	c := NewConfig(logger.NewLogger())
+	tmpDir := t.TempDir()
+	// 使用目录路径：os.Stat 成功但 os.ReadFile 失败，触发 Load 错误分支
+	dirPath := filepath.Join(tmpDir, "testdir")
+	require.NoError(t, os.Mkdir(dirPath, 0755))
+
+	cw := NewConfigWatcher(c, dirPath, 50*time.Millisecond, logger.NewLogger())
+	// 设置 lastMod 为过去时间，使 ModTime.After 检查通过
+	cw.lastMod = time.Now().Add(-time.Hour)
+
+	// 直接调用 checkChange，应触发 Load 错误分支但不 panic
+	cw.checkChange()
+}

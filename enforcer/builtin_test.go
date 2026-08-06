@@ -13,6 +13,8 @@ package enforcer
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 // ==================== KeyMatch ====================
@@ -237,4 +239,47 @@ func TestGetBuiltinFunctions(t *testing.T) {
 	if len(fns) != len(expected) {
 		t.Errorf("GetBuiltinFunctions() returned %d functions, want %d", len(fns), len(expected))
 	}
+}
+
+// ==================== 补充覆盖率测试 ====================
+
+func TestNormalizeKeyMatchPath_EmptyAfterTrim(t *testing.T) {
+	// "//" after trimming trailing "/" becomes "" → returns "/"
+	assert.Equal(t, "/", normalizeKeyMatchPath("//", true))
+	// "///" 同理
+	assert.Equal(t, "/", normalizeKeyMatchPath("///", true))
+}
+
+func TestNormalizeKeyMatchPath_NonPath(t *testing.T) {
+	// 不以 "/" 开头直接返回
+	assert.Equal(t, "foo", normalizeKeyMatchPath("foo", true))
+	assert.Equal(t, "bar", normalizeKeyMatchPath("bar", false))
+}
+
+func TestHasWildcardPathSuffix_WithQuery(t *testing.T) {
+	// 带 ? 的路径应先截断再判断
+	assert.True(t, hasWildcardPathSuffix("/foo/*?bar=1"))
+	assert.False(t, hasWildcardPathSuffix("/foo/bar?x=1"))
+}
+
+func TestKeyMatch2_WildcardAll(t *testing.T) {
+	// key2 == "*" 应直接返回 true
+	assert.True(t, KeyMatch2("/anything", "*"))
+	assert.True(t, KeyMatch2("/foo/bar/baz", "*"))
+}
+
+func TestKeyMatch3_WildcardAll(t *testing.T) {
+	// key2 == "*" 应直接返回 true
+	assert.True(t, KeyMatch3("/anything", "*"))
+	assert.True(t, KeyMatch3("/foo/bar/baz", "*"))
+}
+
+func TestKeyMatch2_QueryString(t *testing.T) {
+	// 带 ? 的路径应被截断
+	assert.True(t, KeyMatch2("/foo/bar?page=1", "/foo/:bar"))
+}
+
+func TestKeyMatch3_QueryString(t *testing.T) {
+	// 带 ? 的路径应被截断
+	assert.True(t, KeyMatch3("/foo/bar?page=1", "/foo/{bar}"))
 }

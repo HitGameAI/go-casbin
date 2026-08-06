@@ -12,6 +12,10 @@
 package model
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kamalyes/go-logger"
@@ -174,4 +178,41 @@ func TestValidatePolicyEffect_Empty(t *testing.T) {
 
 	err = validatePolicyEffect(m.GetAssertions())
 	assert.Error(t, err)
+}
+
+func TestModel_LoadFromText_ParseError(t *testing.T) {
+	m := NewModel(newTestLogger())
+	// 超过 bufio.MaxScanTokenSize (64KB) 的行触发 scanner.Err()，使 LoadModelFromText 返回错误
+	longLine := strings.Repeat("a", 70000)
+	err := m.LoadFromText(longLine)
+	assert.Error(t, err)
+}
+
+func TestModel_LoadFromPath_ValidationError(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "model.conf")
+	// 内容可解析但缺少必需段（p/e/m），触发 LoadFromPath 中的 ValidateModel 错误分支
+	err := os.WriteFile(path, []byte("r = sub, obj, act"), 0644)
+	require.NoError(t, err)
+
+	m := NewModel(newTestLogger())
+	err = m.LoadFromPath(path)
+	assert.Error(t, err)
+}
+
+func TestModel_Copy_DeepCopyError(t *testing.T) {
+	m, err := NewModelFromText(testModelText, newTestLogger())
+	require.NoError(t, err)
+
+	// 替换 deepCopyFunc 模拟失败，触发 Copy 的回退分支
+	orig := deepCopyFunc
+	deepCopyFunc = func(dst, src interface{}) error {
+		return fmt.Errorf("deep copy failed")
+	}
+	defer func() { deepCopyFunc = orig }()
+
+	cp := m.Copy()
+	require.NotNil(t, cp)
+	// 回退分支应通过引用复制 assertions
+	assert.NotNil(t, cp.GetAssertion("r"))
 }

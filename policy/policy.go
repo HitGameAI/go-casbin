@@ -299,9 +299,10 @@ func (p *Policy) RemoveFilteredPolicy(sec, ptype string, fieldIndex int, fieldVa
 		return errors.NewPolicyNotFoundError(ptype)
 	}
 
+	// in-place compaction：保留不匹配的策略，仅深拷贝匹配的策略用于回滚
+	// 替代之前的 clear-all + re-add，避免 N 次 AddPolicy 的 strings.Join 分配
 	var removed [][]string
-	var remaining [][]string
-
+	writeIdx := 0
 	for _, policy := range assertion.Policies {
 		match := true
 		for i, value := range fieldValues {
@@ -311,9 +312,10 @@ func (p *Policy) RemoveFilteredPolicy(sec, ptype string, fieldIndex int, fieldVa
 			}
 		}
 		if match {
-			removed = append(removed, policy)
+			removed = append(removed, append([]string(nil), policy...))
 		} else {
-			remaining = append(remaining, policy)
+			assertion.Policies[writeIdx] = policy
+			writeIdx++
 		}
 	}
 
@@ -321,34 +323,22 @@ func (p *Policy) RemoveFilteredPolicy(sec, ptype string, fieldIndex int, fieldVa
 		return nil
 	}
 
-	assertion.ClearPolicies()
-	for _, r := range remaining {
-		assertion.AddPolicy(r)
-	}
+	assertion.Policies = assertion.Policies[:writeIdx]
+	assertion.RebuildPolicyMap()
 
 	if p.autoSave && p.adapter != nil {
 		if pa, ok := p.adapter.(PTypeUpdatableAdapter); ok {
 			if err := pa.UpdateFilteredPoliciesByPType(ptype, nil, fieldIndex, fieldValues...); err != nil {
 				// 回滚内存：恢复被删除的策略
-				assertion.ClearPolicies()
-				for _, r := range removed {
-					assertion.AddPolicy(r)
-				}
-				for _, r := range remaining {
-					assertion.AddPolicy(r)
-				}
+				assertion.Policies = append(assertion.Policies, removed...)
+				assertion.RebuildPolicyMap()
 				return errors.WrapError("RemoveFilteredPolicy", err)
 			}
 		} else if ua, ok := p.adapter.(UpdatableAdapter); ok {
 			if err := ua.UpdateFilteredPolicies(nil, fieldIndex, fieldValues...); err != nil {
 				// 回滚内存：恢复被删除的策略
-				assertion.ClearPolicies()
-				for _, r := range removed {
-					assertion.AddPolicy(r)
-				}
-				for _, r := range remaining {
-					assertion.AddPolicy(r)
-				}
+				assertion.Policies = append(assertion.Policies, removed...)
+				assertion.RebuildPolicyMap()
 				return errors.WrapError("RemoveFilteredPolicy", err)
 			}
 		} else {
@@ -384,12 +374,10 @@ func (p *Policy) UpdateFilteredPolicies(sec, ptype string, newPolicies [][]strin
 		return errors.NewPolicyNotFoundError(ptype)
 	}
 
-	oldPolicies := make([][]string, len(assertion.Policies))
-	for i, rule := range assertion.Policies {
-		oldPolicies[i] = append([]string(nil), rule...)
-	}
-
-	var remaining [][]string
+	// in-place compaction：保留不匹配的策略，仅深拷贝匹配的策略用于回滚
+	// 替代之前的深拷贝全部策略 + clear-all + re-add，避免 O(N) 次 AddPolicy 分配
+	var oldMatched [][]string
+	writeIdx := 0
 	for _, rule := range assertion.Policies {
 		match := true
 		for i, value := range fieldValues {
@@ -398,18 +386,22 @@ func (p *Policy) UpdateFilteredPolicies(sec, ptype string, newPolicies [][]strin
 				break
 			}
 		}
-		if !match {
-			remaining = append(remaining, rule)
+		if match {
+			oldMatched = append(oldMatched, append([]string(nil), rule...))
+		} else {
+			assertion.Policies[writeIdx] = rule
+			writeIdx++
 		}
 	}
+	compactedLen := writeIdx
+	assertion.Policies = assertion.Policies[:compactedLen]
+	assertion.RebuildPolicyMap()
 
-	assertion.ClearPolicies()
-	for _, rule := range remaining {
-		assertion.AddPolicy(rule)
-	}
+	// 追加新策略
 	for _, rule := range newPolicies {
 		if !assertion.HasPolicy(rule) {
-			assertion.AddPolicy(rule)
+			assertion.Policies = append(assertion.Policies, rule)
+			assertion.PolicyMap[strings.Join(rule, ",")] = len(assertion.Policies) - 1
 		}
 	}
 
@@ -428,10 +420,10 @@ func (p *Policy) UpdateFilteredPolicies(sec, ptype string, newPolicies [][]strin
 			err = p.adapter.SavePolicy(p.allPolicyLines())
 		}
 		if err != nil {
-			assertion.ClearPolicies()
-			for _, rule := range oldPolicies {
-				assertion.AddPolicy(rule)
-			}
+			// 回滚：截断新增策略，恢复被删除的策略
+			assertion.Policies = assertion.Policies[:compactedLen]
+			assertion.Policies = append(assertion.Policies, oldMatched...)
+			assertion.RebuildPolicyMap()
 			return errors.WrapError("UpdateFilteredPolicies", err)
 		}
 	}

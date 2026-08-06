@@ -81,9 +81,21 @@ func TestAssertion_RebuildPolicyMap(t *testing.T) {
 
 	// 手动修改 Policies 后重建索引
 	a.Policies = append(a.Policies, []string{"eve", "data3", "write"})
-	a.rebuildPolicyMap()
+	a.RebuildPolicyMap()
 
 	assert.Equal(t, 0, a.PolicyMap["alice,data1,read"])
 	assert.Equal(t, 1, a.PolicyMap["bob,data2,write"])
 	assert.Equal(t, 2, a.PolicyMap["eve,data3,write"])
+}
+
+func TestAssertion_RebuildPolicyMap_NilPolicyMap(t *testing.T) {
+	// 直接构造 Assertion，PolicyMap 为 nil，触发 RebuildPolicyMap 的 nil 分支
+	a := &Assertion{
+		Key:      "p",
+		Value:    "sub, obj, act",
+		Policies: [][]string{{"alice", "data1", "read"}},
+	}
+	a.RebuildPolicyMap()
+	assert.NotNil(t, a.PolicyMap)
+	assert.Equal(t, 0, a.PolicyMap["alice,data1,read"])
 }

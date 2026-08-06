@@ -87,3 +87,21 @@ func TestLoadModelFromFile_StatError(t *testing.T) {
 	_, err = LoadModelFromFile(file)
 	assert.Error(t, err)
 }
+
+func TestLoadModelFromFile_ReadError(t *testing.T) {
+	// 将文件指针 Seek 到文件末尾之后，Read 返回 io.EOF 触发错误分支
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "model.conf")
+	err := os.WriteFile(path, []byte(testModelText), 0644)
+	require.NoError(t, err)
+
+	file, err := os.Open(path)
+	require.NoError(t, err)
+	defer file.Close()
+
+	// Seek 到文件末尾远端，使 Read 返回 io.EOF
+	file.Seek(1000000, 0)
+
+	_, err = LoadModelFromFile(file)
+	assert.Error(t, err)
+}

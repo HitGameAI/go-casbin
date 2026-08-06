@@ -248,8 +248,5 @@ func FilterPoliciesByValueIndex(lines []string, ptype string, fieldIndex int, fi
 // 策略行格式为 "p, alice, data1, read"，提取第一个逗号前的部分
 func ExtractPType(line string) string {
 	parts := strings.SplitN(line, ",", 2)
-	if len(parts) > 0 {
-		return strings.TrimSpace(parts[0])
-	}
-	return ""
+	return strings.TrimSpace(parts[0])
 }

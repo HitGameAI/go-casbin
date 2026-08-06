@@ -25,7 +25,6 @@ import (
 	"github.com/kamalyes/go-casbin/role"
 	"github.com/kamalyes/go-logger"
 	"github.com/kamalyes/go-toolbox/pkg/breaker"
-	"github.com/kamalyes/go-toolbox/pkg/idgen"
 	"github.com/kamalyes/go-toolbox/pkg/mathx"
 	"github.com/kamalyes/go-toolbox/pkg/retry"
 	"github.com/kamalyes/go-toolbox/pkg/syncx"
@@ -85,7 +84,6 @@ type Enforcer struct {
 	stateMachine *syncx.StateMachine[string] // 状态机（管理执行器生命周期：Disabled→Ready→Error）
 	breaker      *breaker.Circuit            // 熔断器（保护下游存储，防止级联故障）
 	retry        *retry.Retry                // 重试器（指数退避+抖动，自动重试临时性故障）
-	idGenerator  idgen.IDGenerator           // ID 生成器（生成 TraceID/SpanID/RequestID 用于追踪）
 	logger       logger.ILogger              // 日志记录器（基于 go-logger，支持结构化日志）
 
 	customFuncs map[string]BuiltinFunc // 自定义匹配函数（可在 matcher 表达式中使用）
@@ -100,14 +98,16 @@ type Enforcer struct {
 	authSkipPolicies   [][]string // 认证免鉴权策略（需 JWT 但跳过 Casbin 的路径，不持久化到适配器）
 
 	// 性能优化：缓存热路径上重复创建的对象
-	effectEvaluator *policy.EffectEvaluator   // 缓存效果评估器（effect 表达式在模型加载后不变）
-	extraPolicies   map[string]*PolicySegment // 缓存额外策略段（p2/p3 等，策略变更时重建）
-	matcherExpr     string                    // 缓存 matcher 表达式（模型加载后不变）
-	requestTokens   []string                  // 缓存请求 token 列表（r 段定义，模型加载后不变）
-	shortCircuit    bool                      // 缓存短路优化标志（effect 表达式不变时结果不变）
-	hasEval         bool                      // 缓存 matcher 是否含 eval()（模型加载后不变，避免每次 doEnforce 重复扫描）
-	hasGFunc        bool                      // 缓存 matcher 是否含 g()（模型加载后不变，避免每次 doEnforce 重复扫描）
-	normalizeHost   func(string) string       // 自定义域名归一化函数（默认不处理）
+	effectEvaluator       *policy.EffectEvaluator   // 缓存效果评估器（effect 表达式在模型加载后不变）
+	extraPolicies         map[string]*PolicySegment // 缓存额外策略段（p2/p3 等，策略变更时重建）
+	matcherExpr           string                    // 缓存 matcher 表达式（模型加载后不变）
+	requestTokens         []string                  // 缓存请求 token 列表（r 段定义，模型加载后不变）
+	cachedPolicyAssertion *model.Assertion          // 缓存 p 段策略断言（模型加载后不变，避免每次 doEnforce map 查找）
+	shortCircuit          bool                      // 缓存短路优化标志（effect 表达式不变时结果不变）
+	hasEval               bool                      // 缓存 matcher 是否含 eval()（模型加载后不变，避免每次 doEnforce 重复扫描）
+	hasGFunc              bool                      // 缓存 matcher 是否含 g()（模型加载后不变，避免每次 doEnforce 重复扫描）
+	effectIndex           int                       // 缓存 p.eft 在 assertion.Tokens 中的索引（-1 无 eft 字段），extractEffect O(1)
+	normalizeHost         func(string) string       // 自定义域名归一化函数（默认不处理）
 
 	// Enforce 结果缓存：缓存 (sub,obj,act,...) → allow/deny，命中后跳过 RLock+matcher，O(1) 返回
 	// 仅缓存全 string 的 rvals（ABAC 结构体不缓存）；策略变更时主动失效
@@ -158,7 +158,6 @@ func NewEnforcer(opts ...Option) (*Enforcer, error) {
 		breaker:            o.breaker,
 		retry:              o.retry,
 		stateMachine:       sm,
-		idGenerator:        idgen.NewIDGenerator(string(idgen.GeneratorTypeUUID)),
 		customFuncs:        make(map[string]BuiltinFunc),
 		publicPolicies:     o.publicPolicies,
 		authSkipPolicies:   o.authSkipPolicies,
@@ -338,9 +337,6 @@ func (e *Enforcer) EnforceContext(ctx context.Context, rvals ...interface{}) (bo
 // enforceCore Enforce 核心校验流程（熔断器/重试/doEnforce）
 // 由 EnforceContext 在缓存 miss 时调用
 func (e *Enforcer) enforceCore(ctx context.Context, rvals ...interface{}) (bool, error) {
-	traceID := e.idGenerator.GenerateTraceID()
-	requestID := e.idGenerator.GenerateRequestID()
-
 	enforceFn := func() (bool, error) {
 		return e.doEnforce(ctx, rvals...)
 	}
@@ -348,8 +344,7 @@ func (e *Enforcer) enforceCore(ctx context.Context, rvals ...interface{}) (bool,
 	if e.breaker != nil {
 		result, err := e.executeWithBreaker(enforceFn)
 		if err != nil {
-			e.logger.ErrorContextKV(ctx, "Enforce failed with breaker",
-				"trace_id", traceID, "request_id", requestID, "error", err.Error())
+			e.logger.ErrorContextKV(ctx, "Enforce failed with breaker", "error", err.Error())
 			return false, err
 		}
 		return result, nil
@@ -370,8 +365,7 @@ func (e *Enforcer) enforceCore(ctx context.Context, rvals ...interface{}) (bool,
 
 	result, err := enforceFn()
 	if err != nil {
-		e.logger.ErrorContextKV(ctx, "Enforce failed",
-			"trace_id", traceID, "request_id", requestID, "error", err.Error())
+		e.logger.ErrorContextKV(ctx, "Enforce failed", "error", err.Error())
 		return false, err
 	}
 
@@ -392,6 +386,13 @@ var enforceCacheKeyPool = syncx.NewPool(func() *[]byte {
 // 高并发场景下显著降低 GC 压力（50w QPS 时每秒 50w 次 map 分配）
 var requestMapPool = syncx.NewPool(func() map[string]interface{} {
 	return make(map[string]interface{}, 4)
+})
+
+// matchContextPool 复用 MatchContext，减少 doEnforce 热路径上的堆分配
+// 每次 doEnforce 调用都需要一个 MatchContext，池化后零分配
+// 所有字段在每次使用时被覆写，无需 clear
+var matchContextPool = syncx.NewPool(func() *MatchContext {
+	return &MatchContext{}
 })
 
 // buildEnforceCacheKey 构建 Enforce 结果缓存键
@@ -526,26 +527,9 @@ func (e *Enforcer) doEnforceWithMatcher(ctx context.Context, matcherExpr string,
 		return false, errors.NewModelInvalidError("matcher expression is empty")
 	}
 
-	policyAssertion := e.getPolicyAssertion()
-	if policyAssertion == nil {
-		return false, errors.NewPolicyNotFoundError(policy.PTypePolicy)
-	}
-
-	mc := &MatchContext{
-		Request:       request,
-		Policies:      policyAssertion.Policies,
-		RoleMgr:       e.roleMgr,
-		Assertion:     policyAssertion,
-		CustomFuncs:   e.customFuncs,
-		ExtraPolicies: e.getExtraPolicies(),
-		ShortCircuit:  e.shortCircuit,
-		HasEval:       strings.Contains(expr, policy.EvalFunc),
-		HasGFunc:      strings.Contains(expr, policy.GFunc),
-	}
-
-	matched, matchedEffects, err := e.matcher.Match(mc, expr)
+	matched, matchedEffects, err := e.evaluateMatch(request, expr, strings.Contains(expr, policy.EvalFunc), strings.Contains(expr, policy.GFunc))
 	if err != nil {
-		return false, errors.WrapError("matcher execution failed", err)
+		return false, err
 	}
 
 	if !matched {
@@ -587,26 +571,9 @@ func (e *Enforcer) enforceExWithMatcherExpr(matcherExpr string, rvals ...interfa
 		return false, nil, errors.NewModelInvalidError("matcher expression is empty")
 	}
 
-	policyAssertion := e.getPolicyAssertion()
-	if policyAssertion == nil {
-		return false, nil, errors.NewPolicyNotFoundError(policy.PTypePolicy)
-	}
-
-	mc := &MatchContext{
-		Request:       request,
-		Policies:      policyAssertion.Policies,
-		RoleMgr:       e.roleMgr,
-		Assertion:     policyAssertion,
-		CustomFuncs:   e.customFuncs,
-		ExtraPolicies: e.getExtraPolicies(),
-		ShortCircuit:  e.shortCircuit,
-		HasEval:       strings.Contains(expr, policy.EvalFunc),
-		HasGFunc:      strings.Contains(expr, policy.GFunc),
-	}
-
-	matched, matchedEffects, err := e.matcher.Match(mc, expr)
+	matched, matchedEffects, err := e.evaluateMatch(request, expr, strings.Contains(expr, policy.EvalFunc), strings.Contains(expr, policy.GFunc))
 	if err != nil {
-		return false, nil, errors.WrapError("matcher execution failed", err)
+		return false, nil, err
 	}
 
 	if !matched {
@@ -1113,76 +1080,67 @@ func (e *Enforcer) HasRoleForUser(name, roleName string, domain ...string) bool 
 }
 
 // AddRoleForUser 为用户添加角色（同时写入适配器和通知其他节点）
+// 优化：notifyPolicyChange 移出锁外，减少锁内网络 IO 持锁时间，避免阻塞 Enforce 读操作
 func (e *Enforcer) AddRoleForUser(user, roleName string, domain ...string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if err := e.roleMgr.AddLink(user, roleName, domain...); err != nil {
-		return err
-	}
-
-	if e.autoSave && e.policy.GetAdapter() != nil {
-		line := "g, " + user + ", " + roleName
-		if len(domain) > 0 {
-			line += ", " + domain[0]
+	return e.withLockAndNotify(func() error {
+		if err := e.roleMgr.AddLink(user, roleName, domain...); err != nil {
+			return err
 		}
-		if err := e.policy.GetAdapter().AddPolicy(line); err != nil {
-			e.roleMgr.DeleteLink(user, roleName, domain...)
-			return errors.WrapError("auto-save role", err)
+
+		if e.autoSave && e.policy.GetAdapter() != nil {
+			line := "g, " + user + ", " + roleName
+			if len(domain) > 0 {
+				line += ", " + domain[0]
+			}
+			if err := e.policy.GetAdapter().AddPolicy(line); err != nil {
+				e.roleMgr.DeleteLink(user, roleName, domain...)
+				return errors.WrapError("auto-save role", err)
+			}
 		}
-	}
-
-	e.notifyPolicyChange(policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, []string{user, roleName})
-
-	return nil
+		return nil
+	}, policy.EventTypePolicyAdded, policy.PTypeGrouping, nil, []string{user, roleName})
 }
 
 // DeleteRoleForUser 删除用户的角色（同时从适配器删除和通知其他节点）
+// 优化：notifyPolicyChange 移出锁外，减少锁内网络 IO 持锁时间，避免阻塞 Enforce 读操作
 func (e *Enforcer) DeleteRoleForUser(user, roleName string, domain ...string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	return e.withLockAndNotify(func() error {
+		e.roleMgr.DeleteLink(user, roleName, domain...)
 
-	e.roleMgr.DeleteLink(user, roleName, domain...)
-
-	if e.autoSave && e.policy.GetAdapter() != nil {
-		line := "g, " + user + ", " + roleName
-		if len(domain) > 0 {
-			line += ", " + domain[0]
+		if e.autoSave && e.policy.GetAdapter() != nil {
+			line := "g, " + user + ", " + roleName
+			if len(domain) > 0 {
+				line += ", " + domain[0]
+			}
+			if err := e.policy.GetAdapter().RemovePolicy(line); err != nil {
+				return errors.WrapError("auto-remove role", err)
+			}
 		}
-		if err := e.policy.GetAdapter().RemovePolicy(line); err != nil {
-			return errors.WrapError("auto-remove role", err)
-		}
-	}
-
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, []string{user, roleName}, nil)
-
-	return nil
+		return nil
+	}, policy.EventTypePolicyRemoved, policy.PTypeGrouping, []string{user, roleName}, nil)
 }
 
 // DeleteRolesForUser 删除用户的所有角色
 // 同时清理 g 段策略、适配器持久化和分布式通知
+// 优化：notifyPolicyChange 移出锁外，减少锁内网络 IO 持锁时间，避免阻塞 Enforce 读操作
 func (e *Enforcer) DeleteRolesForUser(user string, domain ...string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	roles := e.roleMgr.GetRoles(user, domain...)
-	if len(roles) == 0 {
-		return nil
-	}
-
-	for _, r := range roles {
-		e.roleMgr.DeleteLink(user, r, domain...)
-	}
-
-	if e.autoSave && e.policy.GetAdapter() != nil {
-		if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, 0, user); err != nil {
-			e.logger.WarnKV("Failed to remove filtered grouping policy", "user", user, "error", err.Error())
+	return e.withLockAndNotify(func() error {
+		roles := e.roleMgr.GetRoles(user, domain...)
+		if len(roles) == 0 {
+			return nil
 		}
-	}
 
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, []string{user}, nil)
+		for _, r := range roles {
+			e.roleMgr.DeleteLink(user, r, domain...)
+		}
 
-	return nil
+		if e.autoSave && e.policy.GetAdapter() != nil {
+			if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, 0, user); err != nil {
+				e.logger.WarnKV("Failed to remove filtered grouping policy", "user", user, "error", err.Error())
+			}
+		}
+		return nil
+	}, policy.EventTypePolicyRemoved, policy.PTypeGrouping, []string{user}, nil)
 }
 
 // DeleteUser 删除用户及其所有角色关系
@@ -1450,44 +1408,38 @@ func (e *Enforcer) GetAllUsersByDomain(domain string) []string {
 
 // DeleteAllUsersByDomain 删除指定域中的所有用户角色关系
 // 同时清理 g 段策略、适配器持久化和分布式通知
+// 优化：notifyPolicyChange 移出锁外，减少锁内网络 IO 持锁时间，避免阻塞 Enforce 读操作
 func (e *Enforcer) DeleteAllUsersByDomain(domain string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	return e.withLockAndNotify(func() error {
+		e.roleMgr.DeleteDomain(domain)
 
-	e.roleMgr.DeleteDomain(domain)
-
-	if e.autoSave && e.policy.GetAdapter() != nil {
-		if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, 2, domain); err != nil {
-			e.logger.WarnKV("Failed to remove filtered grouping policy by domain", "domain", domain, "error", err.Error())
+		if e.autoSave && e.policy.GetAdapter() != nil {
+			if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, 2, domain); err != nil {
+				e.logger.WarnKV("Failed to remove filtered grouping policy by domain", "domain", domain, "error", err.Error())
+			}
 		}
-	}
-
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
-
-	return nil
+		return nil
+	}, policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
 }
 
 // DeleteDomains 批量删除多个域的角色关系
 // 同时清理 g 段策略、适配器持久化和分布式通知
+// 优化：notifyPolicyChange 移出锁外，减少锁内网络 IO 持锁时间，避免阻塞 Enforce 读操作
 func (e *Enforcer) DeleteDomains(domains ...string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	for _, d := range domains {
-		e.roleMgr.DeleteDomain(d)
-	}
-
-	if e.autoSave && e.policy.GetAdapter() != nil {
+	return e.withLockAndNotify(func() error {
 		for _, d := range domains {
-			if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, 2, d); err != nil {
-				e.logger.WarnKV("Failed to remove filtered grouping policy by domain", "domain", d, "error", err.Error())
+			e.roleMgr.DeleteDomain(d)
+		}
+
+		if e.autoSave && e.policy.GetAdapter() != nil {
+			for _, d := range domains {
+				if err := e.policy.RemoveFilteredPolicy(model.SectionRoleDefinition, policy.PTypeGrouping, 2, d); err != nil {
+					e.logger.WarnKV("Failed to remove filtered grouping policy by domain", "domain", d, "error", err.Error())
+				}
 			}
 		}
-	}
-
-	e.notifyPolicyChange(policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
-
-	return nil
+		return nil
+	}, policy.EventTypePolicyRemoved, policy.PTypeGrouping, nil, nil)
 }
 
 // GetAllDomains 获取所有域列表
@@ -1509,8 +1461,12 @@ func (e *Enforcer) GetAllRolesByDomain(domain string) []string {
 // 所有事务方法自行管理锁，避免死锁
 
 // ExecuteInTransaction 在事务中执行批量操作
-// 调用方需确保 fn 内部不会尝试获取 enforcer 锁
 // 适配器支持事务时，所有操作在同一个数据库事务中执行
+//
+// 约束：fn 回调在 e.mu.Lock 持有期间执行，fn 内禁止调用 AddPolicy/RemovePolicy/
+// AddGroupingPolicy 等公开 API（它们内部会 e.mu.Lock 导致自死锁）
+// fn 内应直接调用 e.policy 的内部方法（如 e.policy.AddPolicy/e.policy.RemoveFilteredPolicy）
+// 参见 TransactionalSyncUserRoles/TransactionalDeleteUser 的实现
 func (e *Enforcer) ExecuteInTransaction(ctx context.Context, fn func() error) error {
 	// 快速失败：上下文已取消时不再开启事务，避免 driver: bad connection 等级联错误
 	if err := ctx.Err(); err != nil {
@@ -1520,7 +1476,7 @@ func (e *Enforcer) ExecuteInTransaction(ctx context.Context, fn func() error) er
 	// 原因：事务执行期间 e.policy 的 adapter 会被临时替换为 txAdapter，
 	// 如果此时另一个 goroutine 调用 e.policy.GetAdapter() 会拿到 txAdapter，
 	// 然后 txAdapter.inTransaction=true 导致直接复用已提交/回滚的事务，
-	// 触发 "transaction has already been committed or rolled back" 错误。
+	// 触发 "transaction has already been committed or rolled back" 错误
 	// 读 rootAdapter 用 RLock 与 SetAdapter 的 Lock 同步，读完即释放，避免与回调内 Lock 死锁
 	e.mu.RLock()
 	rootAdapter := e.rootAdapter
@@ -2277,6 +2233,46 @@ func (e *Enforcer) executeWithBreaker(fn func() (bool, error)) (bool, error) {
 	return result, nil
 }
 
+// evaluateMatch 构建 MatchContext 并执行匹配（公共逻辑）
+// doEnforce / doEnforceWithMatcher / enforceExWithMatcherExpr 共用
+// 调用方负责 validateRequest、buildRequest、releaseRequest、expr 校验
+//
+// 性能优化：
+//   - MatchContext 从 pool 复用，避免每次 doEnforce 堆分配
+//   - policyAssertion 使用缓存值，避免每次 map 查找
+//   - hasEval/hasGFunc 由调用方传入预计算值，避免重复 strings.Contains
+func (e *Enforcer) evaluateMatch(request map[string]interface{}, expr string, hasEval, hasGFunc bool) (bool, []string, error) {
+	// 优先使用缓存值（NewEnforcer 时初始化），fallback 到动态查找（兼容手动构建的测试场景）
+	policyAssertion := e.cachedPolicyAssertion
+	if policyAssertion == nil {
+		policyAssertion = e.getPolicyAssertion()
+	}
+	if policyAssertion == nil {
+		return false, nil, errors.NewPolicyNotFoundError(policy.PTypePolicy)
+	}
+
+	// 从 pool 复用 MatchContext，避免每次 doEnforce 堆分配
+	// 所有字段在每次使用时被覆写，Put 前无需 clear（不持有引用）
+	mc := matchContextPool.Get()
+	mc.Request = request
+	mc.Policies = policyAssertion.Policies
+	mc.RoleMgr = e.roleMgr
+	mc.Assertion = policyAssertion
+	mc.CustomFuncs = e.customFuncs
+	mc.ExtraPolicies = e.getExtraPolicies() // 使用缓存的 extraPolicies
+	mc.ShortCircuit = e.shortCircuit        // 短路优化：some(where(p.eft==allow)) 模式下匹配到即返回
+	mc.HasEval = hasEval                    // 预计算值，避免每次 doEnforce 重复 strings.Contains 扫描
+	mc.HasGFunc = hasGFunc                  // 预计算值，避免每次 doEnforce 重复 strings.Contains 扫描
+	mc.EffectIndex = e.effectIndex          // 预计算的 eft 索引，extractEffect O(1)
+
+	matched, matchedEffects, err := e.matcher.Match(mc, expr)
+	matchContextPool.Put(mc)
+	if err != nil {
+		return false, nil, errors.WrapError("matcher execution failed", err)
+	}
+	return matched, matchedEffects, nil
+}
+
 // doEnforce 执行权限校验核心逻辑
 // 流程：校验请求参数 → 构建请求 → 获取 matcher 表达式 → 匹配策略 → 评估策略效果
 // 内置 panic 恢复机制，防止匹配函数异常导致服务崩溃
@@ -2314,26 +2310,9 @@ func (e *Enforcer) doEnforce(ctx context.Context, rvals ...interface{}) (bool, e
 		return false, errors.NewModelInvalidError("matcher expression is empty")
 	}
 
-	policyAssertion := e.getPolicyAssertion()
-	if policyAssertion == nil {
-		return false, errors.NewPolicyNotFoundError(policy.PTypePolicy)
-	}
-
-	mc := &MatchContext{
-		Request:       request,
-		Policies:      policyAssertion.Policies,
-		RoleMgr:       e.roleMgr,
-		Assertion:     policyAssertion,
-		CustomFuncs:   e.customFuncs,
-		ExtraPolicies: e.getExtraPolicies(), // 使用缓存的 extraPolicies
-		ShortCircuit:  e.shortCircuit,       // 短路优化：some(where(p.eft==allow)) 模式下匹配到即返回
-		HasEval:       e.hasEval,            // 使用预计算的缓存值，避免每次 doEnforce 重复 strings.Contains 扫描
-		HasGFunc:      e.hasGFunc,           // 使用预计算的缓存值，避免每次 doEnforce 重复 strings.Contains 扫描
-	}
-
-	matched, matchedEffects, err := e.matcher.Match(mc, matcherExpr)
+	matched, matchedEffects, err := e.evaluateMatch(request, matcherExpr, e.hasEval, e.hasGFunc)
 	if err != nil {
-		return false, errors.WrapError("matcher execution failed", err)
+		return false, err
 	}
 
 	if !matched {
@@ -2363,6 +2342,20 @@ func (e *Enforcer) initCachedFields() {
 
 	// 缓存 request tokens（r 段定义）
 	e.requestTokens = e.getRequestTokens()
+
+	// 缓存 p 段策略断言，避免每次 doEnforce 调用 getPolicyAssertion 做 map 查找
+	e.cachedPolicyAssertion = e.getPolicyAssertion()
+
+	// 预计算 p.eft 索引，extractEffect 从 O(n) token 遍历降为 O(1) 索引访问
+	e.effectIndex = -1
+	if e.cachedPolicyAssertion != nil {
+		for i, token := range e.cachedPolicyAssertion.Tokens {
+			if token == "p.eft" {
+				e.effectIndex = i
+				break
+			}
+		}
+	}
 
 	// 缓存 effect 评估器
 	effectExpr := ""
@@ -2487,11 +2480,9 @@ func (e *Enforcer) buildRequest(rvals ...interface{}) map[string]interface{} {
 		return nil
 	}
 
-	// 从 pool 复用 map，clear 残留数据
+	// 从 pool 复用 map，clear 残留数据（releaseRequest 已 clear，此处防御性清空）
 	request := requestMapPool.Get()
-	for k := range request {
-		delete(request, k)
-	}
+	clear(request)
 
 	for i, token := range tokens {
 		if i < len(rvals) {
@@ -2508,9 +2499,7 @@ func (e *Enforcer) releaseRequest(request map[string]interface{}) {
 	if request == nil {
 		return
 	}
-	for k := range request {
-		delete(request, k)
-	}
+	clear(request)
 	requestMapPool.Put(request)
 }
 
@@ -2532,19 +2521,13 @@ func normalizeRequestValue(token string, value interface{}) interface{} {
 }
 
 // normalizeHTTPAction 规范 HTTP 动作，确保为大写
-// 例如：GET → GET
-// 例如：post → POST
-// 例如：put → PUT
-// 例如：PATCH → PATCH
-// 例如：delete → DELETE
-// 例如：head → HEAD
-// 例如：options → OPTIONS
-// 例如：connect → CONNECT
-// 例如：trace → TRACE
-// 例如：其他 → 其他
+// 已是大写或非 HTTP 动作（如 read/write/exec）直接返回，零分配
+// 仅小写 HTTP 动作触发 strings.ToUpper
 func normalizeHTTPAction(action string) string {
-	switch strings.ToUpper(action) {
+	switch action {
 	case "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE":
+		return action
+	case "get", "post", "put", "patch", "delete", "head", "options", "connect", "trace":
 		return strings.ToUpper(action)
 	default:
 		return action
@@ -2759,23 +2742,34 @@ func (e *Enforcer) GetNotifier() policy.PolicyNotifier {
 
 // SetNotifier 设置策略变更通知器
 // 设置后自动订阅变更事件
+//
+// 死锁防护：Close/Subscribe 在锁外执行
+// 旧通知器的 EventLoop 回调 handlePolicyChange → ReloadPolicy 需要获取 e.mu.Lock
+// 若在锁内调用 Close（内部 wg.Wait 等待 EventLoop 退出），会与回调形成死锁：
+//
+//	主 goroutine: 持 e.mu.Lock → Close → wg.Wait
+//	EventLoop:    handlePolicyChange → ReloadPolicy → 等 e.mu.Lock
 func (e *Enforcer) SetNotifier(notifier policy.PolicyNotifier) error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	// 关闭旧的通知器
-	if e.notifier != nil {
-		_ = e.notifier.Close()
-	}
-
+	oldNotifier := e.notifier
 	e.notifier = notifier
+	e.mu.Unlock()
 
-	// 订阅新的通知器
+	// 锁外订阅新通知器：成功后再关闭旧的，避免事件处理真空期
 	if notifier != nil {
 		if err := notifier.Subscribe(context.Background(), e.handlePolicyChange); err != nil {
+			// Subscribe 失败，回滚 notifier 引用
+			e.mu.Lock()
+			e.notifier = oldNotifier
+			e.mu.Unlock()
 			e.logger.WarnKV("Failed to subscribe policy notifier", "error", err.Error())
 			return err
 		}
+	}
+
+	// 锁外关闭旧通知器：避免与 EventLoop 回调 handlePolicyChange 死锁
+	if oldNotifier != nil {
+		_ = oldNotifier.Close()
 	}
 
 	return nil

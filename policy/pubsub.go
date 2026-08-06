@@ -13,6 +13,7 @@ package policy
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -170,9 +171,10 @@ func WithRetry(interval time.Duration, count int) NotifierOption {
 // 不使用任何消息中间件，仅在进程内广播事件
 // 适用于单机部署或测试场景
 type LocalNotifier struct {
-	config   *NotifierConfig
-	handlers []ChangeEventHandler
-	stopCh   chan struct{}
+	config    *NotifierConfig
+	handlers  []ChangeEventHandler
+	stopCh    chan struct{}
+	closeOnce sync.Once
 }
 
 // NewLocalNotifier 创建本地通知器
@@ -210,8 +212,11 @@ func (ln *LocalNotifier) Unsubscribe() error {
 }
 
 // Close 关闭本地通知器
+// 使用 closeOnce 防止重复 close 导致 panic
 func (ln *LocalNotifier) Close() error {
-	close(ln.stopCh)
+	ln.closeOnce.Do(func() {
+		close(ln.stopCh)
+	})
 	ln.handlers = nil
 	return nil
 }

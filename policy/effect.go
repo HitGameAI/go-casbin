@@ -69,13 +69,13 @@ func NewEffectEvaluator(effectExpr string) *EffectEvaluator {
 	case strings.Contains(lower, "!some(where"):
 		mode = evalModeNotSomeWhere
 		target = EffectDeny // evaluateNotSomeWhere: targetEffect 总是 Deny
-	case strings.Contains(lower, "some(where"):
-		mode = evalModeSomeWhere
+	case strings.Contains(lower, "some(where (p_eft"):
+		mode = evalModeSomeWhereP
 		if strings.Contains(lower, EffectDeny) {
 			target = EffectDeny
 		}
-	case strings.Contains(lower, "some(where (p_eft"):
-		mode = evalModeSomeWhereP
+	case strings.Contains(lower, "some(where"):
+		mode = evalModeSomeWhere
 		if strings.Contains(lower, EffectDeny) {
 			target = EffectDeny
 		}

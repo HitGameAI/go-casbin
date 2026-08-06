@@ -32,6 +32,10 @@ func TestArray2DEquals(t *testing.T) {
 
 	c := [][]string{{"a", "b"}}
 	assert.False(t, Array2DEquals(a, c))
+
+	// 相同长度但内容不同 → 覆盖循环内 return false
+	d := [][]string{{"a", "b"}, {"x", "y"}}
+	assert.False(t, Array2DEquals(a, d))
 }
 
 func TestSortedArray2DEquals(t *testing.T) {
@@ -41,6 +45,10 @@ func TestSortedArray2DEquals(t *testing.T) {
 
 	c := [][]string{{"a", "b"}}
 	assert.False(t, SortedArray2DEquals(a, c))
+
+	// 相同长度但排序后内容不同 → 覆盖循环内 return false
+	d := [][]string{{"a", "b"}, {"x", "y"}}
+	assert.False(t, SortedArray2DEquals(a, d))
 }
 
 // ==================== 排序测试 ====================
@@ -61,6 +69,13 @@ func TestSortArray2D_DifferentLengths(t *testing.T) {
 	arr := [][]string{{"a", "b", "c"}, {"a", "b"}, {"a"}}
 	SortArray2D(arr)
 	assert.Equal(t, [][]string{{"a"}, {"a", "b"}, {"a", "b", "c"}}, arr)
+}
+
+func TestSortArray2D_DifferentLengthsUnsorted(t *testing.T) {
+	// 未排序的不同长度数组，确保比较函数中 len(arr[j]) < minLen 分支被覆盖
+	arr := [][]string{{"c", "d", "e"}, {"a", "b"}, {"f"}}
+	SortArray2D(arr)
+	assert.Equal(t, [][]string{{"a", "b"}, {"c", "d", "e"}, {"f"}}, arr)
 }
 
 // ==================== 去重测试 ====================
@@ -88,6 +103,10 @@ func TestSet2DEquals(t *testing.T) {
 	a := [][]string{{"b", "a"}, {"d", "c"}}
 	b := [][]string{{"a", "b"}, {"c", "d"}}
 	assert.True(t, Set2DEquals(a, b))
+
+	// 不同长度 → 覆盖 len(a) != len(b) 分支
+	c := [][]string{{"a", "b"}}
+	assert.False(t, Set2DEquals(a, c))
 }
 
 func TestSetSubtract(t *testing.T) {

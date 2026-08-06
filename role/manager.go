@@ -86,7 +86,14 @@ func (rm *RoleManager) DeleteLink(name1, name2 string, domain ...string) {
 // HasLink 检查角色继承关系（含间接继承，支持域隔离和缓存）
 // 优先从缓存读取结果，缓存未命中时委托给 RoleHierarchy 进行 DFS 查询
 // 查询结果会写入缓存，后续相同查询直接命中缓存
+//
+// 性能优化：自链接（name1==name2）直接返回 true，跳过 buildCacheKey 的字符串拼接
+// RBAC 场景中 g(r.sub, p.sub) 经常出现 r.sub==p.sub，避免热路径上的无谓分配
 func (rm *RoleManager) HasLink(name1, name2 string, domain ...string) bool {
+	if name1 == name2 {
+		return true
+	}
+
 	cacheKey := rm.buildCacheKey(name1, name2, domain...)
 	if result, ok := rm.cache.Load(cacheKey); ok {
 		return result.(bool)

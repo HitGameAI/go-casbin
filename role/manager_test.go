@@ -316,3 +316,10 @@ func TestRoleManager_GetImplicitUsers_MaxDepth(t *testing.T) {
 	assert.Contains(t, users, "editor")
 	assert.NotContains(t, users, "admin")
 }
+
+func TestRoleManager_HasLink_Self(t *testing.T) {
+	rm := newTestManager()
+	// name1 == name2 时直接返回 true（自链接快速路径）
+	assert.True(t, rm.HasLink("alice", "alice"))
+	assert.True(t, rm.HasLink("alice", "alice", "tenant1"))
+}

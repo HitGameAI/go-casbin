@@ -64,17 +64,26 @@ func (pw *PolicyWatcher) AddCallback(cb WatcherCallback) {
 
 // Start 启动文件变更监控
 // 记录初始修改时间，启动后台监控循环
+// 支持 Stop 后重新 Start：重建 stopCh 和 workerPool，避免复用已关闭的资源
 func (pw *PolicyWatcher) Start() error {
 	pw.mu.Lock()
 	if pw.running {
 		pw.mu.Unlock()
 		return nil
 	}
+	// 重建 stopCh 和 workerPool，支持 Stop 后重新 Start
+	// 避免复用已 close 的 stopCh 导致 watchLoop 立即退出
+	pw.stopCh = make(chan struct{})
+	pw.workerPool = syncx.NewWorkerPool(5, 20)
 	pw.running = true
 	pw.mu.Unlock()
 
 	info, err := os.Stat(pw.filePath)
 	if err != nil {
+		// 文件不存在时回退 running 状态，避免后续 Stop 误判
+		pw.mu.Lock()
+		pw.running = false
+		pw.mu.Unlock()
 		return err
 	}
 	pw.lastModTime = info.ModTime()

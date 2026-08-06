@@ -204,6 +204,25 @@ func TestPolicyValueIndexFiltering(t *testing.T) {
 	}
 }
 
+func TestMatchPolicyValuesByIndex_EmptyFieldValues(t *testing.T) {
+	// 空 fieldValues → 直接返回 true
+	if !MatchPolicyValuesByIndex("p, alice, data1, read", 0) {
+		t.Fatal("expected true for empty fieldValues")
+	}
+}
+
+func TestFilterPoliciesByValueIndex_EmptyAll(t *testing.T) {
+	lines := []string{
+		"p, alice, data1, read",
+		"p, bob, data2, write",
+	}
+	// fieldValues 为空且 ptype 为空 → 返回原始列表的副本
+	got := FilterPoliciesByValueIndex(lines, "", 0)
+	if !equalStrings(got, lines) {
+		t.Fatalf("FilterPoliciesByValueIndex() = %v, want %v", got, lines)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
