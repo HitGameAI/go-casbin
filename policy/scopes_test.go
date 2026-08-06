@@ -72,10 +72,11 @@ func TestSortArray2D_DifferentLengths(t *testing.T) {
 }
 
 func TestSortArray2D_DifferentLengthsUnsorted(t *testing.T) {
-	// 未排序的不同长度数组，确保比较函数中 len(arr[j]) < minLen 分支被覆盖
-	arr := [][]string{{"c", "d", "e"}, {"a", "b"}, {"f"}}
+	// 未排序的不同长度数组，短数组在前以确保比较函数中 len(arr[j]) < minLen 分支被覆盖
+	// 插入排序调用 less(higherIndex, lowerIndex)，当低位元素更短时触发该分支
+	arr := [][]string{{"a"}, {"c", "d", "e"}, {"a", "b"}}
 	SortArray2D(arr)
-	assert.Equal(t, [][]string{{"a", "b"}, {"c", "d", "e"}, {"f"}}, arr)
+	assert.Equal(t, [][]string{{"a"}, {"a", "b"}, {"c", "d", "e"}}, arr)
 }
 
 // ==================== 去重测试 ====================
