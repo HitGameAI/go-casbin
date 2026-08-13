@@ -4,15 +4,15 @@
  * @LastEditors: kamalyes 501893067@qq.com
  * @LastEditTime: 2026-08-01 00:15:16
  * @FilePath: \go-casbin\enforcer\domain_identity.go
- * @Description: 租户域名身份绑定（正向校验 + 主机→租户反向映射联动）
+ * @Description: 租户域名身份绑定（正向校验 + 反向查询共用同一条 p2 策略）
  *
- * p2 策略同时承载两类策略，通过 act 区分，互不干扰：
- *  1. 正向校验：p2 = r.sub != "", <tenantID>, "domain::<host>", HOST
- *     EnforceTenantHostBinding 通过 Enforce 匹配，r.act == HOST 天然过滤反向映射
- *  2. 反向映射：p2 = r.sub != "", <tenantID>, "domain::<host>", HOST_TENANT_MAP
- *     ResolveTenantByHost 通过 GetFilteredNamedPolicy 按 act 过滤，读取 dom 字段获取 tenantID
+ * 每个 host 绑定只存一条 p2 策略，同时服务正向校验和反向查询：
+ *   p2 = r.sub != "", <tenantID>, "domain::<host>", HOST
  *
- * 联动保证：SyncTenantHostBindings 对每个 host 同时添加/删除正向+反向策略，
+ * 1. 正向校验 EnforceTenantHostBinding：通过 Enforce 匹配，r.act == HOST
+ * 2. 反向查询 ResolveTenantByHost：通过 GetFilteredNamedPolicy 按 act=HOST 过滤，读取 dom 字段获取 tenantID
+ *
+ * 联动保证：SyncTenantHostBindings 对每个 host 添加/删除策略，
  * 确保登录反查（ResolveTenantByHost）和授权正向校验（EnforceTenantHostBinding）数据一致
  *
  * Copyright (c) 2026 by kamalyes, All Rights Reserved.
@@ -34,11 +34,8 @@ type TenantHostBinding struct {
 }
 
 const (
-	// domainIdentityAction 正向校验动作
+	// domainIdentityAction 域名身份绑定动作（正向校验 + 反向查询共用）
 	domainIdentityAction = "HOST"
-
-	// hostTenantMapAction 反向映射动作（与正向校验区分，避免 Enforce 误匹配）
-	hostTenantMapAction = "HOST_TENANT_MAP"
 
 	// domainIdentitySubRule 主体规则（sub 非空即可，不限定具体用户）
 	domainIdentitySubRule = `r.sub != ""`
@@ -64,8 +61,8 @@ func NormalizeDomainHost(host string) string {
 	return strings.ToLower(strings.TrimSuffix(host, "."))
 }
 
-// SyncTenantHostBindings 批量同步租户域名绑定（正向校验 + 反向映射联动）
-// 对 addHosts 中每个 host 同时添加正向+反向策略；removeHosts 同理同时删除
+// SyncTenantHostBindings 批量同步租户域名绑定
+// 对 addHosts 中每个 host 添加策略；removeHosts 删除策略
 // tenantID 为空时跳过（OPS 域无域名限制）
 func (e *Enforcer) SyncTenantHostBindings(tenantID string, addHosts, removeHosts []string) error {
 	if tenantID == "" {
@@ -94,7 +91,7 @@ func (e *Enforcer) EnforceTenantHostBinding(tenantID, userID, host string) (bool
 	return e.Enforce(userID, tenantID, domainIdentityResourcePrefix+host, domainIdentityAction)
 }
 
-// ResolveTenantByHost 根据 host 反查绑定的 tenantID（反向映射查询）
+// ResolveTenantByHost 根据 host 反查绑定的 tenantID
 // 供登录/忘记密码等未认证场景按 host 解析租户；空串表示未绑定
 func (e *Enforcer) ResolveTenantByHost(host string) (string, error) {
 	host = NormalizeDomainHost(host)
@@ -102,7 +99,7 @@ func (e *Enforcer) ResolveTenantByHost(host string) (string, error) {
 		return "", nil
 	}
 	resource := domainIdentityResourcePrefix + host
-	for _, p := range e.GetFilteredNamedPolicy(policy.PTypePolicy2, 2, resource, hostTenantMapAction) {
+	for _, p := range e.GetFilteredNamedPolicy(policy.PTypePolicy2, 2, resource, domainIdentityAction) {
 		if len(p) > 1 && p[1] != "" {
 			return p[1], nil
 		}
@@ -110,11 +107,11 @@ func (e *Enforcer) ResolveTenantByHost(host string) (string, error) {
 	return "", nil
 }
 
-// ListTenantHostBindings 列出租户域名绑定（反向映射策略）
+// ListTenantHostBindings 列出租户域名绑定
 // tenantID 为空时列出所有租户的绑定，非空时仅列出指定租户的绑定
 func (e *Enforcer) ListTenantHostBindings(tenantID string) []TenantHostBinding {
 	bindings := make([]TenantHostBinding, 0)
-	for _, p := range e.GetFilteredNamedPolicy(policy.PTypePolicy2, 3, hostTenantMapAction) {
+	for _, p := range e.GetFilteredNamedPolicy(policy.PTypePolicy2, 3, domainIdentityAction) {
 		// p = [v0=sub_rule, v1=tenantID, v2=domain::host, v3=action]
 		if len(p) < 3 || p[1] == "" {
 			continue
@@ -131,37 +128,25 @@ func (e *Enforcer) ListTenantHostBindings(tenantID string) []TenantHostBinding {
 	return bindings
 }
 
-// addTenantHostBinding 添加租户 host 绑定（正向+反向映射联动，幂等）
+// addTenantHostBinding 添加租户 host 绑定（幂等）
 func (e *Enforcer) addTenantHostBinding(tenantID, host string) error {
 	host = NormalizeDomainHost(host)
 	if host == "" || tenantID == "" {
 		return nil
 	}
 	resource := domainIdentityResourcePrefix + host
-	// 正向校验策略
 	if !e.HasNamedPolicy(policy.PTypePolicy2, domainIdentitySubRule, tenantID, resource, domainIdentityAction) {
-		if err := e.AddNamedPolicy(policy.PTypePolicy2, domainIdentitySubRule, tenantID, resource, domainIdentityAction); err != nil {
-			return err
-		}
-	}
-	// 反向映射策略
-	if !e.HasNamedPolicy(policy.PTypePolicy2, domainIdentitySubRule, tenantID, resource, hostTenantMapAction) {
-		if err := e.AddNamedPolicy(policy.PTypePolicy2, domainIdentitySubRule, tenantID, resource, hostTenantMapAction); err != nil {
-			return err
-		}
+		return e.AddNamedPolicy(policy.PTypePolicy2, domainIdentitySubRule, tenantID, resource, domainIdentityAction)
 	}
 	return nil
 }
 
-// removeTenantHostBinding 删除租户 host 绑定（正向+反向映射联动）
+// removeTenantHostBinding 删除租户 host 绑定
 func (e *Enforcer) removeTenantHostBinding(tenantID, host string) error {
 	host = NormalizeDomainHost(host)
 	if host == "" || tenantID == "" {
 		return nil
 	}
 	resource := domainIdentityResourcePrefix + host
-	if err := e.RemoveNamedPolicy(policy.PTypePolicy2, domainIdentitySubRule, tenantID, resource, domainIdentityAction); err != nil {
-		return err
-	}
-	return e.RemoveNamedPolicy(policy.PTypePolicy2, domainIdentitySubRule, tenantID, resource, hostTenantMapAction)
+	return e.RemoveNamedPolicy(policy.PTypePolicy2, domainIdentitySubRule, tenantID, resource, domainIdentityAction)
 }

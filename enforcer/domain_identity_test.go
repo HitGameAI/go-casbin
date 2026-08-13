@@ -8,7 +8,7 @@
  *
  * 测试覆盖：
  *   1. NormalizeDomainHost 归一化（端口/X-Forwarded-Host/trailing dot/IPv6/大小写）
- *   2. SyncTenantHostBindings 增删联动（正向+反向映射一致性、幂等、空 tenantID 跳过）
+ *   2. SyncTenantHostBindings 增删联动（一致性、幂等、空 tenantID 跳过）
  *   3. EnforceTenantHostBinding 正向校验（命中/未命中/空参数）
  *   4. ResolveTenantByHost 反查租户（命中/未命中/空 host）
  *   5. 多 host 绑定同一租户场景
@@ -121,9 +121,9 @@ func TestSyncTenantHostBindings_Idempotent(t *testing.T) {
 	require.NoError(t, e.SyncTenantHostBindings("t001", []string{"admin.example.com"}, nil))
 	require.NoError(t, e.SyncTenantHostBindings("t001", []string{"admin.example.com"}, nil))
 
-	// p2 策略只有 2 条（正向 + 反向），不会因重复添加而膨胀
+	// p2 策略只有 1 条，不会因重复添加而膨胀
 	p2 := e.GetNamedPolicy("p2")
-	assert.Len(t, p2, 2, "idempotent add should not duplicate policies")
+	assert.Len(t, p2, 1, "idempotent add should not duplicate policies")
 }
 
 func TestSyncTenantHostBindings_EmptyTenantID_NoOp(t *testing.T) {
@@ -425,8 +425,8 @@ func TestListTenantHostBindings_SkipsMalformed(t *testing.T) {
 	require.NoError(t, e.SyncTenantHostBindings("t001", []string{"a.example.com"}, nil))
 
 	// 手动添加格式异常的 p2 策略（len < 3、空 tenantID、空 host）
-	_ = e.SelfAddPolicy("p", "p2", []string{domainIdentitySubRule, "", "domain::", hostTenantMapAction})
-	_ = e.SelfAddPolicy("p", "p2", []string{domainIdentitySubRule, "t001", "", hostTenantMapAction})
+	_ = e.SelfAddPolicy("p", "p2", []string{domainIdentitySubRule, "", "domain::", domainIdentityAction})
+	_ = e.SelfAddPolicy("p", "p2", []string{domainIdentitySubRule, "t001", "", domainIdentityAction})
 
 	bindings := e.ListTenantHostBindings("")
 	// 只应返回正常的 1 条绑定（空 tenantID 和空 host 的条目被跳过）
